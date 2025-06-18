@@ -175,11 +175,12 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
             buf.pop();
         }
 
-        return Ok(String::from_utf8_lossy(&buf).to_string());
+        String::from_utf8(buf)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF8"))
     } else {
         let wchar_count = -len;
         let mut buf = vec![0u8; (wchar_count * 2) as usize];
-        cursor.read_exact(&mut buf);
+        cursor.read_exact(&mut buf)?;
 
         let utf16: Vec<u16> = buf
             .chunks_exact(2)
@@ -192,8 +193,8 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
             _ => &utf16[..]
         };
 
-        return String::from_utf16(utf16_trimmed)
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"));
+        String::from_utf16(utf16_trimmed)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"))
     }
 }
 
@@ -211,7 +212,7 @@ pub fn read_proptag(cursor: &mut Cursor<&Vec<u8>>, name_table: &[String]) -> Res
 
     let type_name_index = cursor.read_u32::<LittleEndian>()?;
     let type_name = name_table.get(type_name_index as usize)
-        .ok_or(Error::new(ErrorKind::InvalidData, "Invalid type name index"))
+        .ok_or(Error::new(ErrorKind::InvalidData, format!("Invalid type name index {}", type_name_index)))
         .unwrap().clone();
 
     let size = cursor.read_u32::<LittleEndian>()?;
@@ -219,31 +220,32 @@ pub fn read_proptag(cursor: &mut Cursor<&Vec<u8>>, name_table: &[String]) -> Res
     Ok(Some(UE3Proptag { name_idx, type_name, size, array_index }))
 }
 
-fn get_arr_el_type(prop: &str) -> &str
+fn get_arr_el_type(prop: &str) -> UE3Proptag
 {
-    match prop
-    {
-        "Characters" | "Kerning" => "StructProperty",
-        "Names" => "NameProperty",
-        "TextureCoordinates" => "StructProperty",
-        "Vertices" => "StructProperty",
-        "Indices" => "IntProperty",
-        "Materials" => "ObjectProperty",
-        "Sockets" => "StructProperty",
-        "Sounds" => "ObjectProperty",
-        "Points" => "StructProperty",
-        "Normals" => "StructProperty",
-        "Tangents" => "StructProperty",
-        "UVs" => "StructProperty",
-        "ExtraUVs" => "StructProperty",
+    let type_name = match prop {
+        "Characters" | "Kerning" |
+        "TextureCoordinates" | "Vertices" |
+        "Sockets" | "Points" | "Normals" |
+        "Tangents" | "UVs" | "ExtraUVs" |
         "InstanceData" => "StructProperty",
-        "ChildComponents" => "ObjectProperty",
+
+        "Names" => "NameProperty",
+        "Indices" => "IntProperty",
+        "Materials" | "Sounds" | "ChildComponents" => "ObjectProperty",
+
         name if name.ends_with("Names") => "NameProperty",
         name if name.ends_with("Objects") => "ObjectProperty",
         name if name.ends_with("Indices") => "IntProperty",
         name if name.ends_with("Floats") => "FloatProperty",
         name if name.ends_with("Bools") => "BoolProperty",
         _ => "IntProperty"
+    };
+
+    UE3Proptag {
+        name_idx: 0,
+        type_name: type_name.to_string(),
+        size: 0,
+        array_index: 0
     }
 }
 
@@ -253,6 +255,7 @@ pub fn parse_prop_val(
     name_table: &[String]
     ) -> Result<UE3Prop>
 {
+
     match tag.type_name.as_str()
     {
         "IntProperty"    => Ok(UE3Prop::Int(cursor.read_i32::<LittleEndian>()?)),
@@ -267,7 +270,11 @@ pub fn parse_prop_val(
         {
             let inner_count = cursor.read_u32::<LittleEndian>()?;
             let et = get_arr_el_type(name_table[tag.name_idx as usize].as_str());
-            let arr = parse_arr_prop(cursor, et, inner_count, name_table)?;
+            println!(
+                "ArrayProperty: name = {}, resolved type = {}, count = {}",
+                name_table[tag.name_idx as usize], et.type_name.as_str(), inner_count
+            );
+            let arr = parse_arr_prop(cursor, et.type_name.as_str(), inner_count, name_table)?;
             Ok(UE3Prop::Array(arr))
         }
         "StructProperty" => {
@@ -377,7 +384,10 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Cooker Version: {}", self.cooker_ver)?;
         writeln!(f, "Compression Flags: {}", self.compression)?;
         writeln!(f, "GUID: {:?}", self.guid)?;
-        writeln!(f, "Generations:")?;
+        if self.gen_count > 0
+        {
+            writeln!(f, "Generations (Count={}):", self.gen_count)?;
+        }
         for (i, gens) in self.gens.iter().enumerate()
         {
             writeln!(

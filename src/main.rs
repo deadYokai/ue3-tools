@@ -112,6 +112,12 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
 
     for i in 0..header.name_count
     {
+        // if i == 0
+        // {
+        //     println!("Name[{}]: NULL", i);
+        //     writeln!(writer, "NULL")?;
+        //     continue;
+        // }
         let s = upkreader::read_name(&mut cur)?;
         println!("Name[{}]: {}", i, s.name);
         writeln!(writer, "{}", s.name)?;
