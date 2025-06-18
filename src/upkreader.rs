@@ -1,4 +1,4 @@
-use std::{fmt, io::{Error, ErrorKind, Read, Seek}};
+use std::{collections::HashMap, fmt, io::{Cursor, Error, ErrorKind, Read, Result, Seek}};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 pub struct Names
@@ -58,8 +58,8 @@ pub struct UpkHeader
     path_len: i32,
     path: Vec<u8>,
     pak_flags: i32,
-    name_count: i32,
-    name_offset: i32,
+    pub name_count: i32,
+    pub name_offset: i32,
     export_count: i32,
     export_offset: i32,
     import_count: i32,
@@ -72,6 +72,231 @@ pub struct UpkHeader
     engine_ver: i32,
     cooker_ver: i32,
     compression: i32
+}
+
+pub enum UE3Prop
+{
+    Array(Vec<UE3Prop>),
+    Bool(bool),
+    Byte(u8),
+    Int(i32),
+    Float(f32),
+    Str(String),
+    Struct(HashMap<String, UE3Prop>),
+    Object(u32),
+    Name(u32),
+    Unknown(String)
+}
+
+pub struct UE3Proptag
+{
+    pub name_idx: u32,
+    pub type_name: String,
+    pub size: u32,
+    pub array_index: u32
+}
+
+pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
+{
+    let len = cursor.read_i32::<LittleEndian>()?;
+    if len == 0
+    {
+        return Ok("".to_string());
+    }
+
+    if len > 0
+    {
+        let mut buf = vec![0u8; len as usize];
+        cursor.read_exact(&mut buf)?;
+
+        if buf.last() == Some(&0)
+        {
+            buf.pop();
+        }
+
+        return Ok(String::from_utf8_lossy(&buf).to_string());
+    } else {
+        let wchar_count = -len;
+        let mut buf = vec![0u8; (wchar_count * 2) as usize];
+        cursor.read_exact(&mut buf);
+
+        let utf16: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+
+        let utf16_trimmed = match utf16.last()
+        {
+            Some(&0) => &utf16[..utf16.len() - 1],
+            _ => &utf16[..]
+        };
+
+        return String::from_utf16(utf16_trimmed)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"));
+    }
+}
+
+pub fn read_proptag(cursor: &mut Cursor<&Vec<u8>>, name_table: &[String]) -> Result<Option<UE3Proptag>>
+{
+    let name_idx = cursor.read_u32::<LittleEndian>()?;
+    let name = name_table.get(name_idx as usize)
+        .ok_or(Error::new(ErrorKind::InvalidData, "Invalid name index"))?;
+
+    if name == "None"
+    {
+        return Ok(None);
+    }
+
+    let type_name_index = cursor.read_u32::<LittleEndian>()?;
+    let type_name = name_table.get(type_name_index as usize)
+        .ok_or(Error::new(ErrorKind::InvalidData, "Invalid type name index"))
+        .unwrap().clone();
+
+    let size = cursor.read_u32::<LittleEndian>()?;
+    let array_index = cursor.read_u32::<LittleEndian>()?;
+    Ok(Some(UE3Proptag { name_idx, type_name, size, array_index }))
+}
+
+fn get_arr_el_type(prop: &str) -> &str
+{
+    match prop
+    {
+        "Characters" | "Kerning" => "StructProperty",
+        "Names" => "NameProperty",
+        "TextureCoordinates" => "StructProperty",
+        "Vertices" => "StructProperty",
+        "Indices" => "IntProperty",
+        "Materials" => "ObjectProperty",
+        "Sockets" => "StructProperty",
+        "Sounds" => "ObjectProperty",
+        "Points" => "StructProperty",
+        "Normals" => "StructProperty",
+        "Tangents" => "StructProperty",
+        "UVs" => "StructProperty",
+        "ExtraUVs" => "StructProperty",
+        "InstanceData" => "StructProperty",
+        "ChildComponents" => "ObjectProperty",
+        name if name.ends_with("Names") => "NameProperty",
+        name if name.ends_with("Objects") => "ObjectProperty",
+        name if name.ends_with("Indices") => "IntProperty",
+        name if name.ends_with("Floats") => "FloatProperty",
+        name if name.ends_with("Bools") => "BoolProperty",
+        _ => "IntProperty"
+    }
+}
+
+pub fn parse_prop_val(
+    cursor: &mut Cursor<&Vec<u8>>,
+    tag: &UE3Proptag,
+    name_table: &[String]
+    ) -> Result<UE3Prop>
+{
+    match tag.type_name.as_str()
+    {
+        "IntProperty"    => Ok(UE3Prop::Int(cursor.read_i32::<LittleEndian>()?)),
+        "FloatProperty"  => Ok(UE3Prop::Float(cursor.read_f32::<LittleEndian>()?)),
+        "BoolProperty"   => Ok(UE3Prop::Bool(cursor.read_u8()? != 0)),
+        "ByteProperty"   => Ok(UE3Prop::Byte(cursor.read_u8()?)),
+        "StrProperty"    => Ok(UE3Prop::Str(read_string(cursor)?)),
+        "NameProperty"   => Ok(UE3Prop::Name(cursor.read_u32::<LittleEndian>()?)),
+        "ObjectProperty" => Ok(UE3Prop::Object(cursor.read_u32::<LittleEndian>()?)),
+
+        "ArrayProperty"  =>
+        {
+            let inner_count = cursor.read_u32::<LittleEndian>()?;
+            let et = get_arr_el_type(name_table[tag.name_idx as usize].as_str());
+            let arr = parse_arr_prop(cursor, et, inner_count, name_table)?;
+            Ok(UE3Prop::Array(arr))
+        }
+        "StructProperty" => {
+                let _size = cursor.read_u32::<LittleEndian>()?;
+                
+                let mut fields = HashMap::new();
+
+                loop
+                {
+                    let tag_o = read_proptag(cursor, name_table)?;
+                    match tag_o
+                    {
+                        None => break,
+                        Some(tag) =>
+                        {
+                            let val = parse_prop_val(cursor, &tag, name_table)?;
+                            let name = name_table.get(tag.name_idx as usize)
+                                .ok_or(Error::new(ErrorKind::InvalidData, "Invalid name index"))?;
+                            fields.insert(name.clone(), val);
+                        }
+                    }
+                }
+                Ok(UE3Prop::Struct(fields))
+        }
+        other => Ok(UE3Prop::Unknown(other.to_string()))
+    }
+}
+
+fn parse_arr_prop(
+    cursor: &mut Cursor<&Vec<u8>>,
+    el_type: &str,
+    count: u32,
+    name_table: &[String]
+) -> Result<Vec<UE3Prop>>
+{
+    let mut elements = Vec::with_capacity(count as usize);
+    for _ in 0..count
+    {
+        let dummy = UE3Proptag
+        {
+            name_idx: 0,
+            type_name: el_type.to_string(),
+            size: 0,
+            array_index: 0
+        };
+
+        let element = parse_prop_val(cursor, &dummy, name_table)?;
+        elements.push(element);
+    }
+
+    Ok(elements)
+}
+
+
+impl fmt::Display for UE3Prop
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self
+        {
+            UE3Prop::Array(arr) => {
+                write!(f, "[")?;
+                for (i, el) in arr.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", el)?;
+                }
+                write!(f, "]")
+            }
+            UE3Prop::Bool(b) => write!(f, "{}", b),
+            UE3Prop::Byte(b) => write!(f, "0x{:02X}", b),
+            UE3Prop::Int(i) => write!(f, "{}", i),
+            UE3Prop::Float(fl) => write!(f, "{}", fl),
+            UE3Prop::Str(s) => write!(f, "\"{}\"", s),
+            UE3Prop::Struct(map) => {
+                write!(f, "{{")?;
+                let mut first = true;
+                for (k, v) in map {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
+            UE3Prop::Object(o) => write!(f, "Object({})", o),
+            UE3Prop::Name(n) => write!(f, "Name({})", n),
+            UE3Prop::Unknown(s) => write!(f, "Unknown({})", s),
+        }
+    }
 }
 
 impl fmt::Display for UpkHeader 
@@ -104,7 +329,7 @@ impl fmt::Display for UpkHeader
     }
 }
 
-pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader, Error>
+pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
 {
     let sig = reader.read_u32::<LittleEndian>()?;
     if sig != 0x9E2A83C1
@@ -175,8 +400,7 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader, Error
     let cv = reader.read_i32::<LittleEndian>()?;
     let cf = reader.read_i32::<LittleEndian>()?;
 
-    Ok(
-        UpkHeader
+    let header = UpkHeader
         {
             sign: sig,
             p_ver: pv,
@@ -199,6 +423,7 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader, Error
             engine_ver: ev,
             cooker_ver: cv,
             compression: cf
-        }
-    )
+        };
+
+    Ok(header)
 }

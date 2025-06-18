@@ -1,19 +1,13 @@
-use std::{env, fs::File, io::{BufReader, Read, Seek, SeekFrom}, path::Path};
-
-use upkdecompress::decompress_chunk;
+use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
 
 mod upkreader;
 mod upkdecompress;
 mod fontmod;
 
-fn main() 
+fn fontext(filepath: &str)
 {
-
-    let args: Vec<String> = env::args().collect();
-
-    let path = Path::new(&args[1]);
-
-    let file = match File::open(path)
+    let path = Path::new(filepath);
+    let mut file = match File::open(path)
     {
         Ok(f) => f,
         Err(e) =>
@@ -23,59 +17,113 @@ fn main()
         }
     };
 
+    fontmod::extract(&mut file);
+
+}
+
+fn upk(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
+{
+
+    let path = Path::new(path);
+
+    let file = File::open(path)?;
+
     let mut reader = BufReader::new(file);
 
-    let header = match upkreader::upk_read_header(&mut reader)
+    let header = upkreader::upk_read_header(&mut reader)?;
+    println!("{}", header);
+
+    // reader.seek(SeekFrom::Start(header.header_size as u64))?;
+    //
+    // let mut chunk_header_buf = vec![0u8; 4096];
+    //
+    // reader.read_exact(&mut chunk_header_buf[..20])?;
+    //
+    // let num_blocks = u32::from_le_bytes(chunk_header_buf[16..20].try_into().unwrap());
+    // let total_header_size = 20 + (num_blocks as usize * 8);
+    // reader.read_exact(&mut chunk_header_buf[20..total_header_size])?;
+    // 
+    // let chunk_header = upkdecompress::parse_chunk_header(&chunk_header_buf[..total_header_size])?;
+    // 
+    // let mut compressed_data = vec![0u8; chunk_header.compressed_size as usize];
+    // reader.read_exact(&mut compressed_data)?;
+    //
+    // let decompressed = upkdecompress::decompress_chunk(&chunk_header, &compressed_data)?;
+    //
+    // println!("Decompressed size: {}", decompressed.len());
+    //
+    // {
+    //     let mut ff = OpenOptions::new()
+    //         .write(true)
+    //         .truncate(true)
+    //         .open(path)?;
+    //     ff.write_all(&decompressed)?;
+    //     ff.flush()?;
+    // }
+
+    reader.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    Ok((Cursor::new(buf), header))
+}
+
+fn el(path: &str, names_path: &str) -> Result<()>
+{
+    let nm_data = fs::read_to_string(names_path)?;
+    let name_table: Vec<String> = nm_data.lines().map(|line| line.trim().to_string()).collect();
+    let el_data = fs::read(path)?;
+    let mut cursor = Cursor::new(&el_data);
+
+    loop
     {
-        Ok(h) =>
+        let _tag = upkreader::read_proptag(&mut cursor, &name_table)?;
+
+        match _tag
         {
-            println!("{}", h);
-            h
+            None => break,
+            Some(tag) =>
+            {
+                let v = upkreader::parse_prop_val(&mut cursor, &tag, &name_table)?;
+                let pn = &name_table[tag.name_idx as usize];
+
+                println!("{} = {}", pn, v);
+            }  
         }
-        Err(e) =>
-        {
-            eprintln!("Err: {}", e);
-            return;
-        }
-    };
+    }
+    Ok(())
+}
 
-    if let Err(e) = reader.seek(SeekFrom::Start(header.header_size as u64))
+fn dump_names(upk_path: &str, output_path: &str) -> Result<()>
+{
+    let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk(upk_path)?;
+    let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
+    cur.seek(SeekFrom::Start(header.name_offset as u64))?;
+
+    println!("Names: (count = {})", header.name_count);
+
+    for i in 0..header.name_count
     {
-        eprintln!("Failed to seek chunks: {}", e);
-        return;
+        let s = upkreader::read_string(&mut cur)?;
+        println!("Name[{}]: {}", i, s);
     }
 
-    let mut chunk_header_buf = vec![0u8; 4096];
+    Ok(())
+}
 
-    if let Err(e) = reader.read_exact(&mut chunk_header_buf[..20])
+fn main() -> Result<()> 
+{
+
+    let args: Vec<String> = env::args().collect();
+
+    let key = &args[1];
+
+    match key.as_str()
     {
-        return;
+        "fontext"   => fontext(&args[2]),
+        "upk"       => { upk(&args[2])?; }
+        "element"   => el(&args[2], &args[3])?,
+        "names"     => dump_names(&args[2], &args[3])?,
+        _           => println!("unknown")
     }
-
-    let num_blocks = u32::from_le_bytes(chunk_header_buf[16..20].try_into().unwrap());
-    let total_header_size = 20 + (num_blocks as usize * 8);
-    if let Err(e) = reader.read_exact(&mut chunk_header_buf[20..total_header_size])
-    {
-        return;
-    }
-
-    let chunk_header = match upkdecompress::parse_chunk_header(&chunk_header_buf[..total_header_size])
-    {
-        Ok(h) => h,
-        Err(e) => return
-    };
-
-    let mut compressed_data = vec![0u8; chunk_header.compressed_size as usize];
-    if let Err(e) = reader.read_exact(&mut compressed_data)
-    {
-        return;
-    }
-
-    let decompressed = match upkdecompress::decompress_chunk(&chunk_header, &compressed_data)
-    {
-        Ok(data) => data,
-        Err(e) => return
-    };
-
-    println!("Decompressed size: {}", decompressed.len());
+    Ok(())
 }
