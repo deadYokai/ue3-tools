@@ -3,8 +3,10 @@ use byteorder::{LittleEndian, ReadBytesExt};
 
 pub struct Names
 {
-    n_len: i32,
-    name: Vec<u8>,
+    pub n_len: i32,
+    pub is_utf16: bool,
+    pub name_bytes: Vec<u8>,
+    pub name: String,
     n_fh: i32,
     n_fl: i32
 }
@@ -96,6 +98,65 @@ pub struct UE3Proptag
     pub array_index: u32
 }
 
+pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<Names>
+{
+    let len = cursor.read_i32::<LittleEndian>()?;
+    
+    if len == 0
+    {
+        return Ok(Names{n_len: 0, is_utf16: false, name: "".to_string(), name_bytes: Vec::new(), n_fh: 0, n_fl: 0})
+    }
+
+    if len > 0
+    {
+        let mut buf = vec![0u8; len as usize];
+        cursor.read_exact(&mut buf)?;
+
+        let n_fh = cursor.read_i32::<LittleEndian>()?;
+        let n_fl = cursor.read_i32::<LittleEndian>()?;
+
+        if buf.last() == Some(&0)
+        {
+            buf.pop();
+        }
+
+        let name = String::from_utf8(buf.clone())
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF8"))?;
+
+        Ok(Names
+        {
+            n_len: len, is_utf16: false, name, name_bytes: buf, n_fh, n_fl
+        })
+
+    } else {
+        let wchar_count = -len;
+        let mut buf = vec![0u8; (wchar_count * 2) as usize];
+        cursor.read_exact(&mut buf)?;
+
+        let n_fh = cursor.read_i32::<LittleEndian>()?;
+        let n_fl = cursor.read_i32::<LittleEndian>()?;
+
+        let utf16: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+
+        let utf16_trimmed = match utf16.last()
+        {
+            Some(&0) => &utf16[..utf16.len() - 1],
+            _ => &utf16[..]
+        };
+
+        let name = String::from_utf16(utf16_trimmed)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"))?;
+        Ok(Names
+        {
+            n_len: wchar_count, is_utf16: true, name, name_bytes: buf, n_fh, n_fl
+        })
+    }
+}
+
+
 pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
 {
     let len = cursor.read_i32::<LittleEndian>()?;
@@ -135,6 +196,7 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
             .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"));
     }
 }
+
 
 pub fn read_proptag(cursor: &mut Cursor<&Vec<u8>>, name_table: &[String]) -> Result<Option<UE3Proptag>>
 {

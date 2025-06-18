@@ -1,4 +1,4 @@
-use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
+use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
 
 mod upkreader;
 mod upkdecompress;
@@ -93,18 +93,28 @@ fn el(path: &str, names_path: &str) -> Result<()>
     Ok(())
 }
 
-fn dump_names(upk_path: &str, output_path: &str) -> Result<()>
+fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
 {
+
+    if output_path.is_empty()
+    {
+        output_path = "names_table.txt";
+    }
+
     let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk(upk_path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
     cur.seek(SeekFrom::Start(header.name_offset as u64))?;
 
     println!("Names: (count = {})", header.name_count);
 
+    let nt_file = File::create(Path::new(output_path))?;
+    let mut writer = BufWriter::new(nt_file);
+
     for i in 0..header.name_count
     {
-        let s = upkreader::read_string(&mut cur)?;
-        println!("Name[{}]: {}", i, s);
+        let s = upkreader::read_name(&mut cur)?;
+        println!("Name[{}]: {}", i, s.name);
+        writeln!(writer, "{}", s.name)?;
     }
 
     Ok(())
@@ -116,13 +126,25 @@ fn main() -> Result<()>
     let args: Vec<String> = env::args().collect();
 
     let key = &args[1];
+    let mut a2 = "";
+    let mut a3 = "";
+
+    if args.len() > 2
+    {
+        a2 = &args[2];
+    }
+
+    if args.len() > 3
+    {
+        a3 = &args[3];
+    }
 
     match key.as_str()
     {
-        "fontext"   => fontext(&args[2]),
-        "upk"       => { upk(&args[2])?; }
-        "element"   => el(&args[2], &args[3])?,
-        "names"     => dump_names(&args[2], &args[3])?,
+        "fontext"   => fontext(a2),
+        "upk"       => { upk(a2)?; }
+        "element"   => el(a2, a3)?,
+        "names"     => dump_names(a2, a3)?,
         _           => println!("unknown")
     }
     Ok(())
