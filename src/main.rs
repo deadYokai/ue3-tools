@@ -1,4 +1,6 @@
-use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
+use std::{env, fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
+
+use upkreader::parse_upk;
 
 mod upkreader;
 mod upkdecompress;
@@ -65,6 +67,21 @@ fn upk(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
     Ok((Cursor::new(buf), header))
+}
+
+fn getlist(path: &str) -> Result<()>
+{
+    let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk(path)?;
+    let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
+
+    let pak = parse_upk(&mut cur, &header)?;
+    let list = upkreader::list_full_obj_paths(pak);
+    for (i, path) in list.iter().enumerate()
+    {
+        println!("#{} {}", i, path);
+    }
+
+    Ok(())
 }
 
 fn el(path: &str, names_path: &str) -> Result<()>
@@ -150,6 +167,7 @@ fn main() -> Result<()>
         "fontext"   => fontext(a2),
         "upk"       => { upk(a2)?; }
         "element"   => el(a2, a3)?,
+        "list"      => getlist(a2)?,
         "names"     => dump_names(a2, a3)?,
         _           => println!("unknown")
     }

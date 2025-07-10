@@ -98,6 +98,174 @@ pub struct UE3Proptag
     pub array_index: u32
 }
 
+pub struct UPKPak
+{
+    pub name_table: Vec<String>,
+    pub export_table: Vec<Export>,
+    pub import_table: Vec<Import>,
+}
+
+pub fn parse_upk(cursor: &mut Cursor<&Vec<u8>>, header: &UpkHeader) -> Result<UPKPak>
+{
+    let name_count = header.name_count;
+    let name_offset = header.name_offset;
+    let export_count = header.export_count;
+    let export_offset = header.export_offset;
+    let import_count = header.import_count;
+    let import_offset = header.import_offset;
+
+    let mut name_table = Vec::new();
+    cursor.set_position(name_offset as u64);
+    for _ in 0..name_count
+    {
+        let name = read_name(cursor)?;
+        name_table.push(name.name);
+    }
+
+    let mut export_table = Vec::new();
+    cursor.set_position(export_offset as u64);
+    for _ in 0..export_count
+    {
+        let obj_type_ref = cursor.read_i32::<LittleEndian>()?;
+        let parent_class_ref = cursor.read_i32::<LittleEndian>()?;
+        let owner_ref = cursor.read_i32::<LittleEndian>()?;
+        let name_tbl_idx = cursor.read_i32::<LittleEndian>()?;
+        let name_count = cursor.read_i32::<LittleEndian>()?;
+        let field6 = cursor.read_i32::<LittleEndian>()?;
+        let obj_flags_h = cursor.read_i32::<LittleEndian>()?;
+        let obj_flags_l = cursor.read_i32::<LittleEndian>()?;
+        let obj_filesize = cursor.read_i32::<LittleEndian>()?;
+        let data_offset = cursor.read_i32::<LittleEndian>()?;
+        let field11 = cursor.read_i32::<LittleEndian>()?;
+        let num_additional_fields = cursor.read_i32::<LittleEndian>()?;
+
+        let mut unk_fields = Vec::new();
+        for _ in 0..num_additional_fields {
+            unk_fields.push(cursor.read_i32::<LittleEndian>()?);
+        }
+
+        let field13 = cursor.read_i32::<LittleEndian>()?;
+        let field14 = cursor.read_i32::<LittleEndian>()?;
+        let field15 = cursor.read_i32::<LittleEndian>()?;
+        let field16 = cursor.read_i32::<LittleEndian>()?;
+        let field17 = cursor.read_i32::<LittleEndian>()?;
+
+        export_table.push(Export {
+            obj_type_ref,
+            parent_class_ref,
+            owner_ref,
+            name_tbl_idx,
+            name_count,
+            field6,
+            obj_flags_h,
+            obj_flags_l,
+            obj_filesize,
+            data_offset,
+            field11,
+            num_additional_fields,
+            field13,
+            field14,
+            field15,
+            field16,
+            field17,
+            unk_fields,
+        });
+
+    }
+
+    // package_idx: i32,
+    // unk1: i32,
+    // obj_type_idx: i32,
+    // unk2: i32,
+    // owner_ref: i32,
+    // name_tbl_idx: i32,
+    // unk3: i32
+
+    let mut import_table = Vec::new();
+
+    cursor.set_position(import_offset as u64);
+    for _ in 0..import_count
+    {
+        let package_idx = cursor.read_i32::<LittleEndian>()?;
+        let unk1 = cursor.read_i32::<LittleEndian>()?;
+        let obj_type_idx = cursor.read_i32::<LittleEndian>()?;
+        let unk2 = cursor.read_i32::<LittleEndian>()?;
+        let owner_ref = cursor.read_i32::<LittleEndian>()?;
+        let name_tbl_idx = cursor.read_i32::<LittleEndian>()?;
+        let unk3 = cursor.read_i32::<LittleEndian>()?;
+
+        import_table.push(Import { package_idx, unk1, obj_type_idx, unk2, owner_ref, name_tbl_idx, unk3 });
+    }
+
+    Ok(UPKPak{name_table, export_table, import_table})
+}
+
+pub fn resolve_type_name(obj_type_ref: i32, pkg: &UPKPak) -> String {
+    if obj_type_ref < 0 {
+        let import_index = (-obj_type_ref - 1) as usize;
+        if import_index < pkg.import_table.len() {
+            let import = &pkg.import_table[import_index];
+            if (import.name_tbl_idx as usize) < pkg.name_table.len() {
+                return pkg.name_table[import.name_tbl_idx as usize].clone();
+            }
+        }
+    } else if obj_type_ref > 0 {
+        let export_index = (obj_type_ref - 1) as usize;
+        if export_index < pkg.export_table.len() {
+            let export = &pkg.export_table[export_index];
+            if (export.name_tbl_idx as usize) < pkg.name_table.len() {
+                return pkg.name_table[export.name_tbl_idx as usize].clone();
+            }
+        }
+    }
+
+    "unk".to_string()
+}
+
+
+pub fn list_full_obj_paths(pkg: UPKPak) -> Vec<String>
+{
+    let mut paths = Vec::new();
+
+    for (idx, _) in pkg.export_table.iter().enumerate()
+    {
+        let mut path_parts = Vec::new();
+        let mut current = Some(idx as i32 + 1);
+
+        while let Some(i) = current
+        {
+            if i <= 0
+            {
+                break;
+            }
+
+            let exp = &pkg.export_table[i as usize - 1];
+
+            let mut name = pkg.name_table
+                .get(exp.name_tbl_idx as usize)
+                .cloned().unwrap_or_else(|| "<invalid>".to_string());
+
+            
+            if exp.name_count > 0
+            {
+                name = format!("{}_{}", name, exp.name_count - 1);
+            }
+
+            let extension = resolve_type_name(exp.obj_type_ref, &pkg);
+            name = format!("{}.{}", name, extension);
+
+            path_parts.push(name);
+
+            current = Some(exp.owner_ref);
+        }
+
+        path_parts.reverse();
+        paths.push(path_parts.join("/"));
+    }
+
+    paths
+}
+
 pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<Names>
 {
     let len = cursor.read_i32::<LittleEndian>()?;
@@ -120,8 +288,10 @@ pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<Names>
             buf.pop();
         }
 
-        let name = String::from_utf8(buf.clone())
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF8"))?;
+        // let name = String::from_utf8(buf.clone())
+        //     .map_err(|_| Error::new(ErrorKind::InvalidData, format!("Invalid UTF8 {:x?}", buf)))?;
+
+        let name = buf.iter().map(|&b| b as char).collect::<String>(); // not utf8 but ISO-8859-1
 
         Ok(Names
         {
@@ -175,8 +345,10 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
             buf.pop();
         }
 
-        String::from_utf8(buf)
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF8"))
+        //String::from_utf8(buf.clone())
+        //     .map_err(|_| Error::new(ErrorKind::InvalidData, format!("Invalid UTF8 {:x?}", buf)))
+
+        Ok(buf.iter().map(|&b| b as char).collect::<String>()) // not utf8 but ISO-8859-1
     } else {
         let wchar_count = -len;
         let mut buf = vec![0u8; (wchar_count * 2) as usize];
@@ -203,7 +375,7 @@ pub fn read_proptag(cursor: &mut Cursor<&Vec<u8>>, name_table: &[String]) -> Res
 {
     let name_idx = cursor.read_u32::<LittleEndian>()?;
     let name = name_table.get(name_idx as usize)
-        .ok_or(Error::new(ErrorKind::InvalidData, "Invalid name index"))?;
+        .ok_or(Error::new(ErrorKind::InvalidData, format!("Invalid name index {}", name_idx)))?;
 
     if name == "None"
     {
@@ -255,8 +427,9 @@ pub fn parse_prop_val(
     name_table: &[String]
     ) -> Result<UE3Prop>
 {
-
-    match tag.type_name.as_str()
+    println!("prop {}", tag.type_name.as_str());
+    
+    match get_arr_el_type(tag.type_name.as_str()).type_name.as_str()
     {
         "IntProperty"    => Ok(UE3Prop::Int(cursor.read_i32::<LittleEndian>()?)),
         "FloatProperty"  => Ok(UE3Prop::Float(cursor.read_f32::<LittleEndian>()?)),
@@ -278,28 +451,32 @@ pub fn parse_prop_val(
             Ok(UE3Prop::Array(arr))
         }
         "StructProperty" => {
-                let _size = cursor.read_u32::<LittleEndian>()?;
-                
-                let mut fields = HashMap::new();
+            println!("Struct?");
+            let _size = cursor.read_u32::<LittleEndian>()?;
 
-                loop
+            let mut fields = HashMap::new();
+
+            loop
+            {
+                let tag_o = read_proptag(cursor, name_table)?;
+                match tag_o
                 {
-                    let tag_o = read_proptag(cursor, name_table)?;
-                    match tag_o
+                    None => break,
+                    Some(tag) =>
                     {
-                        None => break,
-                        Some(tag) =>
-                        {
-                            let val = parse_prop_val(cursor, &tag, name_table)?;
-                            let name = name_table.get(tag.name_idx as usize)
-                                .ok_or(Error::new(ErrorKind::InvalidData, "Invalid name index"))?;
-                            fields.insert(name.clone(), val);
-                        }
+                        let val = parse_prop_val(cursor, &tag, name_table)?;
+                        let name = name_table.get(tag.name_idx as usize)
+                            .ok_or(Error::new(ErrorKind::InvalidData, format!("Invalid name index {}", tag.name_idx)))?;
+                        fields.insert(name.clone(), val);
                     }
                 }
-                Ok(UE3Prop::Struct(fields))
+            }
+            Ok(UE3Prop::Struct(fields))
         }
-        other => Ok(UE3Prop::Unknown(other.to_string()))
+        other => {
+            eprintln!("Warning: Unknown property type '{}'", other);
+            Ok(UE3Prop::Unknown(other.to_string()))
+        }
     }
 }
 
@@ -383,7 +560,7 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Engine Version: {}", self.engine_ver)?;
         writeln!(f, "Cooker Version: {}", self.cooker_ver)?;
         writeln!(f, "Compression Flags: {}", self.compression)?;
-        writeln!(f, "GUID: {:?}", self.guid)?;
+        writeln!(f, "GUID: {:x?}", self.guid)?;
         if self.gen_count > 0
         {
             writeln!(f, "Generations (Count={}):", self.gen_count)?;
@@ -412,7 +589,7 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
     let pv = reader.read_i16::<LittleEndian>()?;
     let lv = reader.read_i16::<LittleEndian>()?;
     let hs = reader.read_i32::<LittleEndian>()?;
-    
+
     let fl = reader.read_i32::<LittleEndian>()?;
     let mut rfl = fl;
     if fl < 0
@@ -421,9 +598,9 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
     }
     let mut pn = vec![0u8; rfl as usize];
     reader.read_exact(&mut pn)?;
-    
+
     let pf = reader.read_i32::<LittleEndian>()?;
-    
+
     let nc = reader.read_i32::<LittleEndian>()?;
     let no = reader.read_i32::<LittleEndian>()?;
     let ec = reader.read_i32::<LittleEndian>()?;
@@ -439,18 +616,18 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
 
     let unks =
         [
-            reader.read_i32::<LittleEndian>()?,
-            reader.read_i32::<LittleEndian>()?,
-            reader.read_i32::<LittleEndian>()?,
-            reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
         ];
 
     let gid =
         [
-            reader.read_i32::<LittleEndian>()?,
-            reader.read_i32::<LittleEndian>()?,
-            reader.read_i32::<LittleEndian>()?,
-            reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
+        reader.read_i32::<LittleEndian>()?,
         ];
 
     let gc = reader.read_i32::<LittleEndian>()?;
@@ -473,29 +650,29 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
     let cf = reader.read_i32::<LittleEndian>()?;
 
     let header = UpkHeader
-        {
-            sign: sig,
-            p_ver: pv,
-            l_ver: lv,
-            header_size: hs,
-            path_len: fl,
-            path: pn,
-            pak_flags: pf,
-            name_count: nc,
-            name_offset: no,
-            export_count: ec,
-            export_offset: eo,
-            import_count: ic,
-            import_offset: io,
-            depends_offset: depo,
-            unk: unks,
-            guid: gid,
-            gen_count: gc,
-            gens: gns,
-            engine_ver: ev,
-            cooker_ver: cv,
-            compression: cf
-        };
+    {
+        sign: sig,
+        p_ver: pv,
+        l_ver: lv,
+        header_size: hs,
+        path_len: fl,
+        path: pn,
+        pak_flags: pf,
+        name_count: nc,
+        name_offset: no,
+        export_count: ec,
+        export_offset: eo,
+        import_count: ic,
+        import_offset: io,
+        depends_offset: depo,
+        unk: unks,
+        guid: gid,
+        gen_count: gc,
+        gens: gns,
+        engine_ver: ev,
+        cooker_ver: cv,
+        compression: cf
+    };
 
     Ok(header)
 }
