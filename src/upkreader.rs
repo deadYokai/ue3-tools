@@ -1,5 +1,6 @@
-use std::{collections::HashMap, fmt, io::{Cursor, Error, ErrorKind, Read, Result, Seek}};
+use std::{collections::HashMap, fmt, fs::File, io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::Path};
 use byteorder::{LittleEndian, ReadBytesExt};
+use freetype::outline;
 
 pub struct Names
 {
@@ -54,26 +55,26 @@ pub struct GenerationInfo
 pub struct UpkHeader
 {
     sign: u32,
-    p_ver: i16,
-    l_ver: i16,
+    pub p_ver: i16,
+    pub l_ver: i16,
     pub header_size: i32,
     path_len: i32,
     path: Vec<u8>,
     pak_flags: i32,
     pub name_count: i32,
     pub name_offset: i32,
-    export_count: i32,
-    export_offset: i32,
-    import_count: i32,
-    import_offset: i32,
-    depends_offset: i32,
+    pub export_count: i32,
+    pub export_offset: i32,
+    pub import_count: i32,
+    pub import_offset: i32,
+    pub depends_offset: i32,
     unk: [i32; 4],
-    guid: [i32; 4],
-    gen_count: i32,
-    gens: Vec<GenerationInfo>,
-    engine_ver: i32,
-    cooker_ver: i32,
-    compression: i32
+    pub guid: [i32; 4],
+    pub gen_count: i32,
+    pub gens: Vec<GenerationInfo>,
+    pub engine_ver: i32,
+    pub cooker_ver: i32,
+    pub compression: i32
 }
 
 pub enum UE3Prop
@@ -222,14 +223,8 @@ pub fn resolve_type_name(obj_type_ref: i32, pkg: &UPKPak) -> String {
     "unk".to_string()
 }
 
-
-pub fn list_full_obj_paths(pkg: UPKPak) -> Vec<String>
-{
-    let mut paths = Vec::new();
-
-    for (idx, _) in pkg.export_table.iter().enumerate()
-    {
-        let mut path_parts = Vec::new();
+fn export_full_path(pkg: &UPKPak, idx: usize) -> String {
+    let mut path_parts = Vec::new();
         let mut current = Some(idx as i32 + 1);
 
         while let Some(i) = current
@@ -251,7 +246,7 @@ pub fn list_full_obj_paths(pkg: UPKPak) -> Vec<String>
                 name = format!("{}_{}", name, exp.name_count - 1);
             }
 
-            let extension = resolve_type_name(exp.obj_type_ref, &pkg);
+            let extension = resolve_type_name(exp.obj_type_ref, pkg);
             name = format!("{}.{}", name, extension);
 
             path_parts.push(name);
@@ -260,10 +255,52 @@ pub fn list_full_obj_paths(pkg: UPKPak) -> Vec<String>
         }
 
         path_parts.reverse();
-        paths.push(path_parts.join("/"));
+        path_parts.join("/")
+
+}
+
+pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String>
+{
+    pkg.export_table
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| export_full_path(pkg, idx))
+        .collect()
+}
+
+pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: Option<&Path>) -> Result<()> {
+    let mut out_dir = out_dir.unwrap_or(Path::new("output"));
+
+    if out_dir.as_os_str().is_empty()
+    {
+        out_dir = Path::new("output");
     }
 
-    paths
+    if !out_dir.exists() {
+        std::fs::create_dir_all(out_dir)?;
+    }
+
+    for (idx, exp) in pkg.export_table.iter().enumerate() {
+        let full_path = export_full_path(pkg, idx);
+
+        if full_path.contains(path) {
+            let file_path = out_dir.join(&full_path);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            cursor.seek(std::io::SeekFrom::Start(exp.data_offset as u64))?;
+            let mut buffer = vec![0u8; exp.obj_filesize as usize];
+            cursor.read_exact(&mut buffer)?;
+
+            let mut out_file = File::create(&file_path)?;
+            out_file.write_all(&buffer)?;
+
+            println!("Exported {} ({} bytes) to {}", full_path, buffer.len(), file_path.display());
+        }
+    }
+
+    Ok(())
 }
 
 pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<Names>
@@ -410,7 +447,7 @@ fn get_arr_el_type(prop: &str) -> UE3Proptag
         name if name.ends_with("Indices") => "IntProperty",
         name if name.ends_with("Floats") => "FloatProperty",
         name if name.ends_with("Bools") => "BoolProperty",
-        _ => "IntProperty"
+        _ => prop
     };
 
     UE3Proptag {
@@ -441,6 +478,7 @@ pub fn parse_prop_val(
 
         "ArrayProperty"  =>
         {
+            println!("Array?");
             let inner_count = cursor.read_u32::<LittleEndian>()?;
             let et = get_arr_el_type(name_table[tag.name_idx as usize].as_str());
             println!(
@@ -451,8 +489,11 @@ pub fn parse_prop_val(
             Ok(UE3Prop::Array(arr))
         }
         "StructProperty" => {
-            println!("Struct?");
+            let _ = cursor.read_u32::<LittleEndian>()?;
+            let _count = cursor.read_u32::<LittleEndian>()?;
+            let _ = cursor.read_u32::<LittleEndian>()?;
             let _size = cursor.read_u32::<LittleEndian>()?;
+            println!("Struct? {} {}", _count, _size);
 
             let mut fields = HashMap::new();
 

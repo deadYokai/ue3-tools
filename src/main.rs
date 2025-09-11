@@ -1,4 +1,4 @@
-use std::{env, fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
+use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, BufWriter, Cursor, ErrorKind, Read, Result, Seek, SeekFrom, Write, Error}, path::Path, process::exit};
 
 use upkreader::parse_upk;
 
@@ -23,7 +23,7 @@ fn fontext(filepath: &str)
 
 }
 
-fn upk(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
+fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
 {
 
     let path = Path::new(path);
@@ -35,34 +35,46 @@ fn upk(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
     let header = upkreader::upk_read_header(&mut reader)?;
     println!("{}", header);
 
-    // reader.seek(SeekFrom::Start(header.header_size as u64))?;
-    //
-    // let mut chunk_header_buf = vec![0u8; 4096];
-    //
-    // reader.read_exact(&mut chunk_header_buf[..20])?;
-    //
-    // let num_blocks = u32::from_le_bytes(chunk_header_buf[16..20].try_into().unwrap());
-    // let total_header_size = 20 + (num_blocks as usize * 8);
-    // reader.read_exact(&mut chunk_header_buf[20..total_header_size])?;
-    // 
-    // let chunk_header = upkdecompress::parse_chunk_header(&chunk_header_buf[..total_header_size])?;
-    // 
-    // let mut compressed_data = vec![0u8; chunk_header.compressed_size as usize];
-    // reader.read_exact(&mut compressed_data)?;
-    //
-    // let decompressed = upkdecompress::decompress_chunk(&chunk_header, &compressed_data)?;
-    //
-    // println!("Decompressed size: {}", decompressed.len());
-    //
-    // {
-    //     let mut ff = OpenOptions::new()
-    //         .write(true)
-    //         .truncate(true)
-    //         .open(path)?;
-    //     ff.write_all(&decompressed)?;
-    //     ff.flush()?;
-    // }
+    if header.compression != 0 
+    {
 
+        let mut chunk_header_buf = vec![0u8; 16];
+        reader.read_exact(&mut chunk_header_buf)?;
+
+        let num_blocks = u32::from_le_bytes(chunk_header_buf[..16].try_into().unwrap()) as usize;
+
+        chunk_header_buf.resize(16 + num_blocks * 8, 0);
+        reader.read_exact(&mut chunk_header_buf[16..])?;
+
+        let chunks = upkdecompress::read_compressed_chunks(&mut &chunk_header_buf[20..], num_blocks)?;
+
+        println!("{:?}", chunks);
+
+        let num_blocks = u32::from_le_bytes(chunk_header_buf[16..20].try_into().unwrap());
+        let total_header_size = 20 + (num_blocks as usize * 8);
+        println!("{:?}", total_header_size);
+        reader.read_exact(&mut chunk_header_buf[20..total_header_size])?;
+
+        let chunk_header = upkdecompress::parse_chunk_header(&chunk_header_buf[..total_header_size])?;
+        println!("{:?}", chunk_header);
+
+        let mut compressed_data = vec![0u8; chunk_header.compressed_size as usize];
+        reader.read_exact(&mut compressed_data)?;
+
+
+        let decompressed = upkdecompress::decompress_chunk(&chunk_header, &compressed_data)?;
+
+        println!("Decompressed size: {}", decompressed.len());
+
+        {
+            let mut ff = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)?;
+            ff.write_all(&decompressed)?;
+            ff.flush()?;
+        }
+    }
     reader.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
@@ -71,11 +83,11 @@ fn upk(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
 
 fn getlist(path: &str) -> Result<()>
 {
-    let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk(path)?;
+    let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
 
     let pak = parse_upk(&mut cur, &header)?;
-    let list = upkreader::list_full_obj_paths(pak);
+    let list = upkreader::list_full_obj_paths(&pak);
     for (i, path) in list.iter().enumerate()
     {
         println!("#{} {}", i, path);
@@ -86,6 +98,7 @@ fn getlist(path: &str) -> Result<()>
 
 fn el(path: &str, names_path: &str) -> Result<()>
 {
+
     let nm_data = fs::read_to_string(names_path)?;
     let name_table: Vec<String> = nm_data.lines().map(|line| line.trim().to_string()).collect();
     let el_data = fs::read(path)?;
@@ -118,7 +131,7 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
         output_path = "names_table.txt";
     }
 
-    let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk(upk_path)?;
+    let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(upk_path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
     cur.seek(SeekFrom::Start(header.name_offset as u64))?;
 
@@ -143,14 +156,32 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
     Ok(())
 }
 
+fn extract_file(upk_path: &str, path: &str, output_dir: &str) -> Result<()> {
+    let dir_path: &Path = Path::new(output_dir);
+    let (mut cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(upk_path)?;
+    let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
+    let up = upkreader::parse_upk(&mut cur, &header)?;
+
+    upkreader::extract_by_name(&mut cursor, &up, path, Some(dir_path))?;
+
+    Ok(())
+}
+
 fn main() -> Result<()> 
 {
 
     let args: Vec<String> = env::args().collect();
 
+    if args.len() <= 1
+    {
+        println!("No args!");
+        exit(0);
+    }
+
     let key = &args[1];
     let mut a2 = "";
     let mut a3 = "";
+    let mut a4 = "";
 
     if args.len() > 2
     {
@@ -162,13 +193,19 @@ fn main() -> Result<()>
         a3 = &args[3];
     }
 
+    if args.len() > 4
+    {
+        a4 = &args[4];
+    }
+
     match key.as_str()
     {
         "fontext"   => fontext(a2),
-        "upk"       => { upk(a2)?; }
+        "upkHeader" => { upk_header_cursor(a2)?; }
         "element"   => el(a2, a3)?,
         "list"      => getlist(a2)?,
         "names"     => dump_names(a2, a3)?,
+        "extract"   => extract_file(a2, a3, a4)?,
         _           => println!("unknown")
     }
     Ok(())

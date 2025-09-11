@@ -3,12 +3,14 @@ use std::io::{Cursor, Read, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use flate2::read::ZlibDecoder;
 
+#[derive(Debug)]
 pub struct CompressedChunkBlock
 {
     pub compressed_size: u32,
     decompressed_size: u32
 }
 
+#[derive(Debug)]
 pub struct CompressedChunkHeader
 {
     sig: u32,
@@ -19,6 +21,7 @@ pub struct CompressedChunkHeader
     blocks: Vec<CompressedChunkBlock>
 }
 
+#[derive(Debug)]
 pub struct CompressedChunk
 {
     decompressed_offset: u32,
