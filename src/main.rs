@@ -234,7 +234,7 @@ fn main() -> Result<()>
         "list"          => getlist(a2)?,
         "names"         => dump_names(a2, a3)?,
         "extract"       => extract_file(a2, a3, a4, false)?,
-        "extractall"    => extract_file(a2, "", a4, true)?,
+        "extractall"    => extract_file(a2, "", a3, true)?,
         _               => println!("unknown")
     }
     Ok(())
