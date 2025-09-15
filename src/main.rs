@@ -1,5 +1,6 @@
 use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, BufWriter, Cursor, ErrorKind, Read, Result, Seek, SeekFrom, Write, Error}, path::Path, process::exit};
 
+use ron::ser::{to_string_pretty, PrettyConfig};
 use upkreader::parse_upk;
 
 mod upkreader;
@@ -156,13 +157,40 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
     Ok(())
 }
 
-fn extract_file(upk_path: &str, path: &str, output_dir: &str) -> Result<()> {
-    let dir_path: &Path = Path::new(output_dir);
+fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> Result<()> {
+    
+    if output_dir.is_empty()
+    {
+        output_dir = "output";
+    }
+
+    let output_dir_path = Path::new(output_dir);
+    
+    let filename = Path::new(upk_path).file_stem().unwrap();
+
+    
+    let pbuf = output_dir_path.join(filename);
+    let dir_path: &Path = pbuf.as_path();
+
     let (mut cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(upk_path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
     let up = upkreader::parse_upk(&mut cur, &header)?;
 
-    upkreader::extract_by_name(&mut cursor, &up, path, Some(dir_path))?;
+    if !dir_path.exists() {
+        std::fs::create_dir_all(dir_path)?;
+    }
+    
+    let mut data_file = File::create(pbuf.with_extension("ron"))?;
+
+    let pretty = PrettyConfig::new().struct_names(true);
+
+    let s = to_string_pretty(&header, pretty.clone()).expect("Fail");
+    writeln!(data_file, "{s}")?;
+
+    let s = to_string_pretty(&up, pretty).expect("Fail");
+    writeln!(data_file, "{s}")?;
+
+    upkreader::extract_by_name(&mut cursor, &up, path, dir_path, all)?;
 
     Ok(())
 }
@@ -200,13 +228,14 @@ fn main() -> Result<()>
 
     match key.as_str()
     {
-        "fontext"   => fontext(a2),
-        "upkHeader" => { upk_header_cursor(a2)?; }
-        "element"   => el(a2, a3)?,
-        "list"      => getlist(a2)?,
-        "names"     => dump_names(a2, a3)?,
-        "extract"   => extract_file(a2, a3, a4)?,
-        _           => println!("unknown")
+        "fontext"       => fontext(a2),
+        "upkHeader"     => { upk_header_cursor(a2)?; }
+        "element"       => el(a2, a3)?,
+        "list"          => getlist(a2)?,
+        "names"         => dump_names(a2, a3)?,
+        "extract"       => extract_file(a2, a3, a4, false)?,
+        "extractall"    => extract_file(a2, "", a4, true)?,
+        _               => println!("unknown")
     }
     Ok(())
 }

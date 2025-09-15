@@ -1,7 +1,8 @@
 use std::{collections::HashMap, fmt, fs::File, io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::Path};
 use byteorder::{LittleEndian, ReadBytesExt};
-use freetype::outline;
+use serde::{Serialize, Deserialize};
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Names
 {
     pub n_len: i32,
@@ -12,6 +13,7 @@ pub struct Names
     n_fl: i32
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Export
 {
     obj_type_ref: i32,
@@ -34,6 +36,7 @@ pub struct Export
     unk_fields: Vec<i32>
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Import
 {
     package_idx: i32,
@@ -45,6 +48,7 @@ pub struct Import
     unk3: i32
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GenerationInfo
 {
     export_count: i32,
@@ -52,6 +56,7 @@ pub struct GenerationInfo
     net_obj_count: i32
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpkHeader
 {
     sign: u32,
@@ -99,6 +104,7 @@ pub struct UE3Proptag
     pub array_index: u32
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UPKPak
 {
     pub name_table: Vec<String>,
@@ -225,37 +231,40 @@ pub fn resolve_type_name(obj_type_ref: i32, pkg: &UPKPak) -> String {
 
 fn export_full_path(pkg: &UPKPak, idx: usize) -> String {
     let mut path_parts = Vec::new();
-        let mut current = Some(idx as i32 + 1);
+    let mut current = Some(idx as i32 + 1);
+    let mut first = true;
 
-        while let Some(i) = current
+    while let Some(i) = current
+    {
+        if i <= 0
         {
-            if i <= 0
-            {
-                break;
-            }
-
-            let exp = &pkg.export_table[i as usize - 1];
-
-            let mut name = pkg.name_table
-                .get(exp.name_tbl_idx as usize)
-                .cloned().unwrap_or_else(|| "<invalid>".to_string());
-
-            
-            if exp.name_count > 0
-            {
-                name = format!("{}_{}", name, exp.name_count - 1);
-            }
-
-            let extension = resolve_type_name(exp.obj_type_ref, pkg);
-            name = format!("{}.{}", name, extension);
-
-            path_parts.push(name);
-
-            current = Some(exp.owner_ref);
+            break;
         }
 
-        path_parts.reverse();
-        path_parts.join("/")
+        let exp = &pkg.export_table[i as usize - 1];
+
+        let mut name = pkg.name_table
+            .get(exp.name_tbl_idx as usize)
+            .cloned().unwrap_or_else(|| "<invalid>".to_string());
+
+
+        if exp.name_count > 0
+        {
+            name = format!("{}_{}", name, exp.name_count - 1);
+        }
+
+        if first {
+            let extension = resolve_type_name(exp.obj_type_ref, pkg);
+            name = format!("{}.{}", name, extension);
+            first = false;
+        }
+        path_parts.push(name);
+
+        current = Some(exp.owner_ref);
+    }
+
+    path_parts.reverse();
+    path_parts.join("/")
 
 }
 
@@ -268,22 +277,14 @@ pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String>
         .collect()
 }
 
-pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: Option<&Path>) -> Result<()> {
-    let mut out_dir = out_dir.unwrap_or(Path::new("output"));
+pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: &Path, all: bool) -> Result<()> {
 
-    if out_dir.as_os_str().is_empty()
-    {
-        out_dir = Path::new("output");
-    }
-
-    if !out_dir.exists() {
-        std::fs::create_dir_all(out_dir)?;
-    }
+    let mut found = false;
 
     for (idx, exp) in pkg.export_table.iter().enumerate() {
         let full_path = export_full_path(pkg, idx);
 
-        if full_path.contains(path) {
+        if full_path.contains(path) || all {
             let file_path = out_dir.join(&full_path);
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -297,7 +298,13 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
             out_file.write_all(&buffer)?;
 
             println!("Exported {} ({} bytes) to {}", full_path, buffer.len(), file_path.display());
+            found = true;
         }
+    }
+
+    if !found
+    {
+        println!("File {} not exists in package.", path);
     }
 
     Ok(())
@@ -325,10 +332,7 @@ pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<Names>
             buf.pop();
         }
 
-        // let name = String::from_utf8(buf.clone())
-        //     .map_err(|_| Error::new(ErrorKind::InvalidData, format!("Invalid UTF8 {:x?}", buf)))?;
-
-        let name = buf.iter().map(|&b| b as char).collect::<String>(); // not utf8 but ISO-8859-1
+        let name = buf.iter().map(|&b| b as char).collect::<String>(); // ISO-8859-1
 
         Ok(Names
         {
