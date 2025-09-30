@@ -59,13 +59,13 @@ pub struct GenerationInfo
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpkHeader
 {
-    sign: u32,
+    pub sign: u32,
     pub p_ver: i16,
     pub l_ver: i16,
     pub header_size: i32,
-    path_len: i32,
-    path: Vec<u8>,
-    pak_flags: i32,
+    pub path_len: i32,
+    pub path: Vec<u8>,
+    pub pak_flags: i32,
     pub name_count: i32,
     pub name_offset: i32,
     pub export_count: i32,
@@ -73,7 +73,7 @@ pub struct UpkHeader
     pub import_count: i32,
     pub import_offset: i32,
     pub depends_offset: i32,
-    unk: [i32; 4],
+    pub unk: [i32; 4],
     pub guid: [i32; 4],
     pub gen_count: i32,
     pub gens: Vec<GenerationInfo>,
@@ -594,6 +594,7 @@ impl fmt::Display for UpkHeader
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result 
     {
+        writeln!(f, "Package Signature: {:x?}", self.sign)?;
         writeln!(f, "Package Version: {}", self.p_ver)?;
         writeln!(f, "Licensee Version: {}", self.l_ver)?;
         writeln!(f, "Header Size: {}", self.header_size)?;

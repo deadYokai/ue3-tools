@@ -1,4 +1,4 @@
-use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, BufWriter, Cursor, ErrorKind, Read, Result, Seek, SeekFrom, Write, Error}, path::Path, process::exit};
+use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
 
 use ron::ser::{to_string_pretty, PrettyConfig};
 use upkreader::parse_upk;
@@ -35,47 +35,14 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
     let header = upkreader::upk_read_header(&mut reader)?;
     println!("{}", header);
+    reader.seek(SeekFrom::Start(size_of::<upkreader::UpkHeader>() as u64))?;
 
     if header.compression != 0 
     {
-
-        let mut chunk_header_buf = vec![0u8; 16];
-        reader.read_exact(&mut chunk_header_buf)?;
-
-        let num_blocks = u32::from_le_bytes(chunk_header_buf[..16].try_into().unwrap()) as usize;
-
-        chunk_header_buf.resize(16 + num_blocks * 8, 0);
-        reader.read_exact(&mut chunk_header_buf[16..])?;
-
-        let chunks = upkdecompress::read_compressed_chunks(&mut &chunk_header_buf[20..], num_blocks)?;
-
-        println!("{:?}", chunks);
-
-        let num_blocks = u32::from_le_bytes(chunk_header_buf[16..20].try_into().unwrap());
-        let total_header_size = 20 + (num_blocks as usize * 8);
-        println!("{:?}", total_header_size);
-        reader.read_exact(&mut chunk_header_buf[20..total_header_size])?;
-
-        let chunk_header = upkdecompress::parse_chunk_header(&chunk_header_buf[..total_header_size])?;
-        println!("{:?}", chunk_header);
-
-        let mut compressed_data = vec![0u8; chunk_header.compressed_size as usize];
-        reader.read_exact(&mut compressed_data)?;
-
-
-        let decompressed = upkdecompress::decompress_chunk(&chunk_header, &compressed_data)?;
-
-        println!("Decompressed size: {}", decompressed.len());
-
-        {
-            let mut ff = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(path)?;
-            ff.write_all(&decompressed)?;
-            ff.flush()?;
-        }
+        println!("Decompression: {:?}", upkdecompress::parse_chunk_header(&mut reader, &header));
+        exit(-1);
     }
+
     reader.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
@@ -195,6 +162,11 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
     Ok(())
 }
 
+fn pack_upk(_ron_path: &str) -> Result<()> {
+    
+    Ok(())
+}
+
 fn main() -> Result<()> 
 {
 
@@ -235,6 +207,7 @@ fn main() -> Result<()>
         "names"         => dump_names(a2, a3)?,
         "extract"       => extract_file(a2, a3, a4, false)?,
         "extractall"    => extract_file(a2, "", a3, true)?,
+        "pack"          => pack_upk(a2)?,
         _               => println!("unknown")
     }
     Ok(())
