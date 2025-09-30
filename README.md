@@ -20,8 +20,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Note that the maintainers reserve the ri
 
 ### Support:
 [Visit my site](https://yokai.digital/)
+
 [Stand For Ukraine](https://standforukraine.com/)
-[![Sternenko Fund](https://cdn.prod.website-files.com/6797b46110ec22b94bac2ef8/67bb453ddf4aa62305189a92_Logo%20ENG.svg)](https://www.sternenkofund.org/en/)
+
+[Sternenko Fund](https://www.sternenkofund.org/en/)
 
 
 ### Contact me:
