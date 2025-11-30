@@ -1,11 +1,45 @@
-use std::{env, fs::{self, File, OpenOptions}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
+use std::{env, fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
 
-use ron::ser::{to_string_pretty, PrettyConfig};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+
+use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
+
+use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkreader::UpkHeader};
 
 mod upkreader;
 mod upkdecompress;
 mod fontmod;
+
+fn extract_from_ron(ron_path: &str, ron_class: &str) -> String {
+    let ron_file = fs::read_to_string(ron_path).unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
+    
+    let fmt = format!("{ron_class}(");
+    let start = ron_file.find(&fmt).unwrap_or_else(|| panic!("`{}` not found in file", ron_class));
+    
+    let mut depth = 1;
+    let mut end = start + fmt.len();
+
+    for (i, c) in ron_file[end..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end += i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if depth != 0 {
+        panic!("Something wrong, when parsing ron file for `{ron_class}`");
+    }
+
+    ron_file[start..end].to_string()
+}
 
 fn fontext(filepath: &str)
 {
@@ -35,11 +69,46 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
     let header = upkreader::upk_read_header(&mut reader)?;
     println!("{}", header);
-    reader.seek(SeekFrom::Start(size_of::<upkreader::UpkHeader>() as u64))?;
 
-    if header.compression != 0 
+    if header.compression != CompressionMethod::None 
     {
-        println!("Decompression: {:?}", upkdecompress::parse_chunk_header(&mut reader, &header));
+        let mut chunks = Vec::new();
+        if header.compressed_chunks != 0 {
+            for _ in 0..header.compressed_chunks {
+                chunks.push(CompressedChunk{
+                    decompressed_offset: reader.read_u32::<LittleEndian>()?,
+                    decompressed_size: reader.read_u32::<LittleEndian>()?,
+                    compressed_offset: reader.read_u32::<LittleEndian>()?,
+                    compressed_size: reader.read_u32::<LittleEndian>()?,
+                });
+            }
+            println!("Compressed chunks: {:?}", chunks);
+        }
+        let mut dec_data: Vec<u8> = Vec::new(); 
+        if header.compression == CompressionMethod::Zlo {
+            for chunk in chunks {
+                reader.seek(SeekFrom::Start(chunk.compressed_offset as u64))?;
+                dec_data = decompress_chunk(
+                    &mut reader,
+                    chunk.compressed_size as usize,
+                    header.compression,
+                    chunk.decompressed_size as usize
+                )?;
+            }
+        }
+
+        reader.seek(SeekFrom::Start(0))?;
+        let mut header_raw_bytes = vec![0u8; 0x79];
+        reader.read_exact(&mut header_raw_bytes)?;
+
+        let file = File::create("../test.upk")?;
+        let mut writer = BufWriter::new(file);
+
+        writer.write_all(&header_raw_bytes)?;
+        writer.write_u32::<LittleEndian>(0)?;
+        writer.write_u32::<LittleEndian>(0)?;
+        writer.write_all(&dec_data)?;
+
         exit(-1);
     }
 
@@ -64,25 +133,37 @@ fn getlist(path: &str) -> Result<()>
     Ok(())
 }
 
-fn el(path: &str, names_path: &str) -> Result<()>
+fn el(path: &str, ron_path: &str) -> Result<()>
 {
+    if path.is_empty()
+    {
+        println!("No object file provided");
+        exit(-1);
+    }
 
-    let nm_data = fs::read_to_string(names_path)?;
-    let name_table: Vec<String> = nm_data.lines().map(|line| line.trim().to_string()).collect();
+    if ron_path.is_empty()
+    {
+        println!("No `.ron` file provided");
+        exit(-1);
+    }
+
+    let upk: upkreader::UPKPak = ron::from_str(&extract_from_ron(ron_path, "UPKPak")).expect("RON Error");
+
+
     let el_data = fs::read(path)?;
     let mut cursor = Cursor::new(&el_data);
 
     loop
     {
-        let _tag = upkreader::read_proptag(&mut cursor, &name_table)?;
+        let _tag = upkreader::read_proptag(&mut cursor, &upk.name_table)?;
 
         match _tag
         {
             None => break,
             Some(tag) =>
             {
-                let v = upkreader::parse_prop_val(&mut cursor, &tag, &name_table)?;
-                let pn = &name_table[tag.name_idx as usize];
+                let v = upkreader::parse_prop_val(&mut cursor, &tag, &upk.name_table)?;
+                let pn = &upk.name_table[tag.name_idx as usize];
 
                 println!("{} = {}", pn, v);
             }  
@@ -163,8 +244,7 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
 }
 
 fn pack_upk(_ron_path: &str) -> Result<()> {
-    
-    Ok(())
+    unimplemented!("For now");
 }
 
 fn main() -> Result<()> 
@@ -179,35 +259,19 @@ fn main() -> Result<()>
     }
 
     let key = &args[1];
-    let mut a2 = "";
-    let mut a3 = "";
-    let mut a4 = "";
-
-    if args.len() > 2
-    {
-        a2 = &args[2];
-    }
-
-    if args.len() > 3
-    {
-        a3 = &args[3];
-    }
-
-    if args.len() > 4
-    {
-        a4 = &args[4];
-    }
+    let ac: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
+    let arg = |i: usize| ac.get(i).copied().unwrap_or("");
 
     match key.as_str()
     {
-        "fontext"       => fontext(a2),
-        "upkHeader"     => { upk_header_cursor(a2)?; }
-        "element"       => el(a2, a3)?,
-        "list"          => getlist(a2)?,
-        "names"         => dump_names(a2, a3)?,
-        "extract"       => extract_file(a2, a3, a4, false)?,
-        "extractall"    => extract_file(a2, "", a3, true)?,
-        "pack"          => pack_upk(a2)?,
+        "fontext"       => fontext(arg(0)),
+        "upkHeader"     => { upk_header_cursor(arg(0))?; }
+        "element"       => el(arg(0), arg(1))?,
+        "list"          => getlist(arg(0))?,
+        "names"         => dump_names(arg(0), arg(1))?,
+        "extract"       => extract_file(arg(0), arg(1), arg(2), false)?,
+        "extractall"    => extract_file(arg(0), "", arg(1), true)?,
+        "pack"          => pack_upk(arg(0))?,
         _               => println!("unknown")
     }
     Ok(())

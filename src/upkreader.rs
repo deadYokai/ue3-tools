@@ -2,6 +2,8 @@ use std::{collections::HashMap, fmt, fs::File, io::{Cursor, Error, ErrorKind, Re
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Serialize, Deserialize};
 
+use crate::upkdecompress::CompressionMethod;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Names
 {
@@ -20,7 +22,8 @@ pub struct Export
     parent_class_ref: i32,
     owner_ref: i32,
     name_tbl_idx: i32,
-    name_count: i32, // if non-zero "_N" added to objName, N = NameCount-1
+    name_count: i32, // if non-zero "_N" added to objName,
+                     // where N = NameCount-1
     field6: i32,
     obj_flags_h: i32,
     obj_flags_l: i32,
@@ -79,7 +82,8 @@ pub struct UpkHeader
     pub gens: Vec<GenerationInfo>,
     pub engine_ver: i32,
     pub cooker_ver: i32,
-    pub compression: i32
+    pub compression: CompressionMethod, 
+    pub compressed_chunks: u32
 }
 
 pub enum UE3Prop
@@ -425,8 +429,8 @@ pub fn read_proptag(cursor: &mut Cursor<&Vec<u8>>, name_table: &[String]) -> Res
 
     let type_name_index = cursor.read_u32::<LittleEndian>()?;
     let type_name = name_table.get(type_name_index as usize)
-        .ok_or(Error::new(ErrorKind::InvalidData, format!("Invalid type name index {}", type_name_index)))
-        .unwrap().clone();
+        .ok_or(Error::new(ErrorKind::InvalidData, format!("Invalid type name index {}", type_name_index)))?
+        .clone();
 
     let size = cursor.read_u32::<LittleEndian>()?;
     let array_index = cursor.read_u32::<LittleEndian>()?;
@@ -470,7 +474,7 @@ pub fn parse_prop_val(
 {
     println!("prop {}", tag.type_name.as_str());
     
-    match get_arr_el_type(tag.type_name.as_str()).type_name.as_str()
+    match tag.type_name.as_str()
     {
         "IntProperty"    => Ok(UE3Prop::Int(cursor.read_i32::<LittleEndian>()?)),
         "FloatProperty"  => Ok(UE3Prop::Float(cursor.read_f32::<LittleEndian>()?)),
@@ -605,7 +609,10 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Import Count: {}", self.import_count)?;
         writeln!(f, "Engine Version: {}", self.engine_ver)?;
         writeln!(f, "Cooker Version: {}", self.cooker_ver)?;
-        writeln!(f, "Compression Flags: {}", self.compression)?;
+        writeln!(f, "Compression Flags: {:#?}", self.compression)?;
+        if self.compression != CompressionMethod::None {
+            writeln!(f, "Num of compressed chunks: {}", self.compressed_chunks)?;
+        }
         writeln!(f, "GUID: {:x?}", self.guid)?;
         if self.gen_count > 0
         {
@@ -626,15 +633,15 @@ impl fmt::Display for UpkHeader
 
 pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
 {
-    let sig = reader.read_u32::<LittleEndian>()?;
-    if sig != 0x9E2A83C1
+    let sign = reader.read_u32::<LittleEndian>()?;
+    if sign != 0x9E2A83C1
     {
-        return Err(Error::new(ErrorKind::InvalidData, format!("Invalid file, sig=0x{:X}", sig)));
+        return Err(Error::new(ErrorKind::InvalidData, format!("Invalid file signature, sig=0x{:X}", sign)));
     }
 
-    let pv = reader.read_i16::<LittleEndian>()?;
-    let lv = reader.read_i16::<LittleEndian>()?;
-    let hs = reader.read_i32::<LittleEndian>()?;
+    let p_ver = reader.read_i16::<LittleEndian>()?;
+    let l_ver = reader.read_i16::<LittleEndian>()?;
+    let header_size = reader.read_i32::<LittleEndian>()?;
 
     let fl = reader.read_i32::<LittleEndian>()?;
     let mut rfl = fl;
@@ -660,13 +667,17 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
         return Err(Error::new(ErrorKind::InvalidData, "Corrupted pak"));
     }
 
-    let unks =
-        [
-        reader.read_i32::<LittleEndian>()?,
-        reader.read_i32::<LittleEndian>()?,
-        reader.read_i32::<LittleEndian>()?,
-        reader.read_i32::<LittleEndian>()?,
-        ];
+    let mut unks = [0; 4];
+
+    if p_ver >= 801 { // found in Dishonored, Batman: Arkham City
+        unks =
+            [
+            reader.read_i32::<LittleEndian>()?,
+            reader.read_i32::<LittleEndian>()?,
+            reader.read_i32::<LittleEndian>()?,
+            reader.read_i32::<LittleEndian>()?,
+            ];
+    }
 
     let gid =
         [
@@ -677,11 +688,11 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
         ];
 
     let gc = reader.read_i32::<LittleEndian>()?;
-    let mut gns = Vec::with_capacity(gc as usize);
+    let mut gens = Vec::with_capacity(gc as usize);
 
     for _ in 0..gc
     {
-        gns.push(
+        gens.push(
             GenerationInfo
             {
                 export_count: reader.read_i32::<LittleEndian>()?,
@@ -693,14 +704,15 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
 
     let ev = reader.read_i32::<LittleEndian>()?;
     let cv = reader.read_i32::<LittleEndian>()?;
-    let cf = reader.read_i32::<LittleEndian>()?;
+    let cf = reader.read_u32::<LittleEndian>()?;
+    let compressed_chunks = reader.read_u32::<LittleEndian>()?;
 
     let header = UpkHeader
     {
-        sign: sig,
-        p_ver: pv,
-        l_ver: lv,
-        header_size: hs,
+        sign,
+        p_ver,
+        l_ver,
+        header_size,
         path_len: fl,
         path: pn,
         pak_flags: pf,
@@ -714,10 +726,11 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
         unk: unks,
         guid: gid,
         gen_count: gc,
-        gens: gns,
+        gens,
         engine_ver: ev,
         cooker_ver: cv,
-        compression: cf
+        compression: CompressionMethod::try_from(cf).unwrap(),
+        compressed_chunks
     };
 
     Ok(header)
