@@ -5,10 +5,11 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
 
-use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkreader::UpkHeader};
+use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::parse_property, upkreader::UpkHeader};
 
 mod upkreader;
 mod upkdecompress;
+mod upkprops;
 mod fontmod;
 
 fn extract_from_ron(ron_path: &str, ron_class: &str) -> String {
@@ -41,23 +42,6 @@ fn extract_from_ron(ron_path: &str, ron_class: &str) -> String {
     ron_file[start..end].to_string()
 }
 
-fn fontext(filepath: &str)
-{
-    let path = Path::new(filepath);
-    let mut file = match File::open(path)
-    {
-        Ok(f) => f,
-        Err(e) =>
-        {
-            eprintln!("Failed to open {}", e);
-            return;
-        }
-    };
-
-    fontmod::extract(&mut file);
-
-}
-
 fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
 {
 
@@ -69,11 +53,12 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
     let header = upkreader::upk_read_header(&mut reader)?;
     println!("{}", header);
-
+     
     if header.compression != CompressionMethod::None 
     {
-        let mut chunks = Vec::new();
+
         if header.compressed_chunks != 0 {
+            let mut chunks = Vec::new();
             for _ in 0..header.compressed_chunks {
                 chunks.push(CompressedChunk{
                     decompressed_offset: reader.read_u32::<LittleEndian>()?,
@@ -83,31 +68,24 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
                 });
             }
             println!("Compressed chunks: {:?}", chunks);
-        }
-        let mut dec_data: Vec<u8> = Vec::new(); 
-        if header.compression == CompressionMethod::Zlo {
-            for chunk in chunks {
-                reader.seek(SeekFrom::Start(chunk.compressed_offset as u64))?;
-                dec_data = decompress_chunk(
-                    &mut reader,
-                    chunk.compressed_size as usize,
-                    header.compression,
-                    chunk.decompressed_size as usize
-                )?;
+
+            let mut dec_data: Vec<u8> = Vec::new(); 
+            if header.compression == CompressionMethod::Zlo {
+                for chunk in chunks {
+                    reader.seek(SeekFrom::Start(chunk.compressed_offset as u64))?;
+                    dec_data = decompress_chunk(
+                        &mut reader,
+                        chunk.compressed_size as usize,
+                        header.compression,
+                        chunk.decompressed_size as usize
+                    )?;
+                }
             }
+
+            let file = File::create("../test.upk")?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(&dec_data)?;
         }
-
-        reader.seek(SeekFrom::Start(0))?;
-        let mut header_raw_bytes = vec![0u8; 0x79];
-        reader.read_exact(&mut header_raw_bytes)?;
-
-        let file = File::create("../test.upk")?;
-        let mut writer = BufWriter::new(file);
-
-        writer.write_all(&header_raw_bytes)?;
-        writer.write_u32::<LittleEndian>(0)?;
-        writer.write_u32::<LittleEndian>(0)?;
-        writer.write_all(&dec_data)?;
 
         exit(-1);
     }
@@ -153,22 +131,10 @@ fn el(path: &str, ron_path: &str) -> Result<()>
     let el_data = fs::read(path)?;
     let mut cursor = Cursor::new(&el_data);
 
-    loop
-    {
-        let _tag = upkreader::read_proptag(&mut cursor, &upk.name_table)?;
-
-        match _tag
-        {
-            None => break,
-            Some(tag) =>
-            {
-                let v = upkreader::parse_prop_val(&mut cursor, &tag, &upk.name_table)?;
-                let pn = &upk.name_table[tag.name_idx as usize];
-
-                println!("{} = {}", pn, v);
-            }  
-        }
+    while let Some(prop) = parse_property(&mut cursor, &upk)? {
+            println!("{:?}", prop);
     }
+
     Ok(())
 }
 
@@ -247,6 +213,10 @@ fn pack_upk(_ron_path: &str) -> Result<()> {
     unimplemented!("For now");
 }
 
+fn swffont(path: &str, ron_path: &str) -> Result<()> {
+    unimplemented!("WIP")
+}
+
 fn main() -> Result<()> 
 {
 
@@ -264,7 +234,7 @@ fn main() -> Result<()>
 
     match key.as_str()
     {
-        "fontext"       => fontext(arg(0)),
+        "swffont"       => swffont(arg(0), arg(1))?,
         "upkHeader"     => { upk_header_cursor(arg(0))?; }
         "element"       => el(arg(0), arg(1))?,
         "list"          => getlist(arg(0))?,
