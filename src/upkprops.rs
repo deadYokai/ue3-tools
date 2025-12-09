@@ -182,10 +182,6 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
         return Ok(None);
     }
 
-    if prop_name == "RawData" {
-        unimplemented!("Researching how implement");
-    }
-
     let type_index = reader.read_i64::<LittleEndian>()?;
     let prop_type = pak.name_table[type_index as usize].clone();
 
