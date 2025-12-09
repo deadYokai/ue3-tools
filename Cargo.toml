@@ -8,5 +8,7 @@ anyhow = "1.0.99"
 byteorder = "1.5.0"
 flate2 = "1.1.2"
 freetype-rs = "0.38.0"
+libc = "0.2.177"
+lzo-sys = "1.0.0"
 ron = "0.11.0"
 serde = { version = "1.0.224", features = ["derive"] }
