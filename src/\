@@ -62,7 +62,7 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
 
     match bytes_per_element {
         1 => {
-            for _ in 0..count {
+            for i in 0..count {
                 let val = reader.read_u8()?;
                 elements.push(PropertyValue::Byte(val));
             }
@@ -75,19 +75,19 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
             let is_obj = first_val < 0 || (first_val > 0 && first_val < 10000);
 
             if is_obj {
-                for _ in 0..count {
+                for i in 0..count {
                     let obj_ref = reader.read_i32::<LittleEndian>()?;
                     elements.push(PropertyValue::Object(obj_ref));
                 }
             } else {
-                for _ in 0..count {
+                for i in 0..count {
                     let val = reader.read_i32::<LittleEndian>()?;
                     elements.push(PropertyValue::Int(val));
                 }
             }
         }
         8 => {
-            for _ in 0..count {
+            for i in 0..count {
                 let idx = reader.read_i64::<LittleEndian>()?;
                 if idx >= 0 && idx < pak.name_table.len() as i64 {
                     let name = pak.name_table[idx as usize].clone();
@@ -97,36 +97,6 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
                 }
             }
         }
-        _ => {
-            let target_end = start_pos + size as u64;
-            let mut element_count = 0;
-
-            while reader.position() < target_end && element_count < count {
-                let element_start = reader.position();
-                let remaining = target_end - element_start;
-                let left = count - element_count;
-
-                if left > 0 {
-                    let est_size = remaining / left as u64;
-                    
-                    if est_size > 0 && est_size < 1_000_000 {
-                        let mut el_data = vec![0u8; est_size as usize];
-                        reader.read_exact(&mut el_data)?;
-                        elements.push(PropertyValue::Raw(el_data));
-                        element_count += 1;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    let bytes_consumed = reader.position();
-    if bytes_consumed != size as u64 {
-        println!("  Warning: size mismatch - expected {}, consumed {}", size, bytes_consumed);
     }
     
     Ok(PropertyValue::Array(elements))
@@ -202,7 +172,7 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
         },
         "StrProperty" => PropertyValue::String(read_string(reader)?),
         "ObjectProperty" => PropertyValue::Object(reader.read_i32::<LittleEndian>()?),
-        "ArrayProperty" => parse_array(reader, pak, size)?,
+        "ArrayProperty" => parse_array(reader, pak)?,
         "StructProperty" => parse_struct(reader, pak, size)?,
         _ => {
             let mut buf = vec![0u8; size as usize];
