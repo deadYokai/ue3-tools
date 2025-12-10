@@ -19,6 +19,24 @@ pub enum PropertyValue {
     Raw(Vec<u8>)
 }
 
+impl PropertyValue {
+    pub fn as_vec(&self) -> Option<&Vec<PropertyValue>> {
+        if let PropertyValue::Array(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_byte(&self) -> Option<u8> {
+        if let PropertyValue::Byte(b) = self {
+            Some(*b)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Property {
     pub name: String,

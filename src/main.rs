@@ -1,8 +1,8 @@
 use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
-use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::parse_property};
+use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::{parse_property, Property, PropertyValue}};
 use clap::{Parser, Subcommand};
 
 mod upkreader;
@@ -110,7 +110,7 @@ fn getlist(path: &str) -> Result<()>
     Ok(())
 }
 
-fn el(path: &str, ron_path: &str) -> Result<()>
+fn el(path: &str, ron_path: &str, print_out: bool) -> Result<Vec<Property>>
 {
     if path.is_empty()
     {
@@ -130,11 +130,15 @@ fn el(path: &str, ron_path: &str) -> Result<()>
     let el_data = fs::read(path)?;
     let mut cursor = Cursor::new(&el_data);
 
+    let mut props = Vec::new();
     while let Some(prop) = parse_property(&mut cursor, &upk)? {
+        if print_out {
             println!("{:?}", prop);
+        }
+        props.push(prop);
     }
 
-    Ok(())
+    Ok(props)    
 }
 
 fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
@@ -207,7 +211,23 @@ fn pack_upk(_ron_path: &str) -> Result<()> {
 }
 
 fn swffont(path: &str, ron_path: &str) -> Result<()> {
-    unimplemented!("WIP")
+    let props = el(path, ron_path, false)?;
+    
+    let rawdata_find: &Property = props.iter().find(|s| s.name == "RawData").unwrap();
+    let rawdata = rawdata_find.value.as_vec();
+
+    let file = File::create("test.gfx")?;
+    let mut writer = BufWriter::new(file);
+
+    if let Some(data) = rawdata {
+        for b in data.iter() {
+            if let Some(byte) = b.as_byte() {
+                writer.write_u8(byte)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -272,7 +292,7 @@ fn main() -> Result<()>
     match cli.command {
         Commands::Swffont { path, ron_path } => swffont(&path, &ron_path)?,
         Commands::UpkHeader { path } => { upk_header_cursor(&path)?; },
-        Commands::Elements { path, ron_path } => el(&path, &ron_path)?,
+        Commands::Elements { path, ron_path } => { el(&path, &ron_path, true)?; },
         Commands::List { path } => getlist(&path)?,
         Commands::Names { path, output_path } => { 
             let out = output_path.as_deref().unwrap_or("");
