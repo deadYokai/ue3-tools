@@ -1,17 +1,16 @@
-use std::{env, fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
-
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-
+use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
+use byteorder::{LittleEndian, ReadBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
-
-use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::parse_property, upkreader::UpkHeader};
+use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::parse_property};
+use clap::{Parser, Subcommand};
 
 mod upkreader;
 mod upkdecompress;
 mod upkprops;
 mod fontmod;
 
+// stupid ron parser
 fn extract_from_ron(ron_path: &str, ron_class: &str) -> String {
     let ron_file = fs::read_to_string(ron_path).unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
     
@@ -157,12 +156,6 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
 
     for i in 0..header.name_count
     {
-        // if i == 0
-        // {
-        //     println!("Name[{}]: NULL", i);
-        //     writeln!(writer, "NULL")?;
-        //     continue;
-        // }
         let s = upkreader::read_name(&mut cur)?;
         println!("Name[{}]: {}", i, s.name);
         writeln!(writer, "{}", s.name)?;
@@ -217,32 +210,84 @@ fn swffont(path: &str, ron_path: &str) -> Result<()> {
     unimplemented!("WIP")
 }
 
+#[derive(Parser)]
+#[command(name = "ue3-tools")]
+#[command(about = "Unreal3 upk stuff")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Swffont {
+        path: String,
+        ron_path: String
+    },
+
+    #[command(about = "Print header info of upk file")]
+    UpkHeader {
+        path: String
+    },
+
+    #[command(about = "Print elements in object")]
+    Elements {
+        path: String,
+        ron_path: String
+    },
+
+    #[command(about = "Print list of objects in upk file")]
+    List {
+        path: String
+    },
+
+    #[command(about = "Print or extract names in upk file")]
+    Names {
+        path: String,
+        output_path: Option<String>
+    },
+
+    #[command(about = "Extract specific object from upk")]
+    Extract {
+        upk_path: String,
+        path: String,
+        output_dir: Option<String>
+    },
+
+    #[command(about = "Extract all objects from upk")]
+    Extractall {
+        upk_path: String,
+        output_dir: Option<String>
+    },
+
+    Pack {
+        ron_path: String
+    }
+}
+
 fn main() -> Result<()> 
 {
+    let cli = Cli::parse();
 
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() <= 1
-    {
-        println!("No args!");
-        exit(0);
+    match cli.command {
+        Commands::Swffont { path, ron_path } => swffont(&path, &ron_path)?,
+        Commands::UpkHeader { path } => { upk_header_cursor(&path)?; },
+        Commands::Elements { path, ron_path } => el(&path, &ron_path)?,
+        Commands::List { path } => getlist(&path)?,
+        Commands::Names { path, output_path } => { 
+            let out = output_path.as_deref().unwrap_or("");
+            dump_names(&path, out)?
+        },
+        Commands::Extract { upk_path, path, output_dir } => {
+            let out = output_dir.as_deref().unwrap_or("");
+            extract_file(&upk_path, &path, out, false)?
+        },
+        Commands::Extractall { upk_path, output_dir } => {
+            let out = output_dir.as_deref().unwrap_or("");
+            extract_file(&upk_path, "", out, true)?
+        },
+        Commands::Pack { .. } => unimplemented!()
     }
 
-    let key = &args[1];
-    let ac: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
-    let arg = |i: usize| ac.get(i).copied().unwrap_or("");
-
-    match key.as_str()
-    {
-        "swffont"       => swffont(arg(0), arg(1))?,
-        "upkHeader"     => { upk_header_cursor(arg(0))?; }
-        "element"       => el(arg(0), arg(1))?,
-        "list"          => getlist(arg(0))?,
-        "names"         => dump_names(arg(0), arg(1))?,
-        "extract"       => extract_file(arg(0), arg(1), arg(2), false)?,
-        "extractall"    => extract_file(arg(0), "", arg(1), true)?,
-        "pack"          => pack_upk(arg(0))?,
-        _               => println!("unknown")
-    }
     Ok(())
 }

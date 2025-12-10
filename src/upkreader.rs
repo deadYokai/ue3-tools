@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, fs::File, io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::Path};
+use std::{fmt, fs::File, io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::Path};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Serialize, Deserialize};
 
