@@ -224,7 +224,10 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
         "FloatProperty" => PropertyValue::Float(reader.read_f32::<LittleEndian>()?),
         "BoolProperty" => PropertyValue::Bool(reader.read_u8()? != 0),
         "ByteProperty" => {
-            if let Some(ref enum_type) = enum_name {
+            // Size
+            // 1 - just a simple byte
+            // 8 - enum
+            if enum_name.is_some() {
                 let enum_val_idx = reader.read_i64::<LittleEndian>()?;
                 if enum_val_idx >= 0 && enum_val_idx < pak.name_table.len() as i64 {
                     let enum_val_name = pak.name_table[enum_val_idx as usize].clone();
