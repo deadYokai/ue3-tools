@@ -43,7 +43,8 @@ pub struct Property {
     pub prop_type: String,
     pub size: i32,
     pub array_index: i32,
-    pub value: PropertyValue
+    pub value: PropertyValue,
+    pub enum_name: Option<String>
 }
 
 pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Result<PropertyValue> {
@@ -206,10 +207,36 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
     let size = reader.read_i32::<LittleEndian>()?;
     let array_index = reader.read_i32::<LittleEndian>()?;
 
+    let enum_name = if prop_type == "ByteProperty" {
+        let enum_index = reader.read_i64::<LittleEndian>()?;
+        if enum_index > 0 && enum_index < pak.name_table.len() as i64 {
+            let name = pak.name_table[enum_index as usize].clone();
+            Some(name)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let value = match prop_type.as_str() {
         "IntProperty" => PropertyValue::Int(reader.read_i32::<LittleEndian>()?),
         "FloatProperty" => PropertyValue::Float(reader.read_f32::<LittleEndian>()?),
         "BoolProperty" => PropertyValue::Bool(reader.read_u8()? != 0),
+        "ByteProperty" => {
+            if let Some(ref enum_type) = enum_name {
+                let enum_val_idx = reader.read_i64::<LittleEndian>()?;
+                if enum_val_idx >= 0 && enum_val_idx < pak.name_table.len() as i64 {
+                    let enum_val_name = pak.name_table[enum_val_idx as usize].clone();
+                    PropertyValue::Name(enum_val_name)
+                } else {
+                    PropertyValue::Int(enum_val_idx as i32)
+                }
+            } else {
+                let val = reader.read_u8()?;
+                PropertyValue::Byte(val)
+            }
+        },
         "NameProperty" => {
             let idx = reader.read_i64::<LittleEndian>()?;
             PropertyValue::Name(pak.name_table[idx as usize].clone())
@@ -230,7 +257,8 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
         prop_type,
         size,
         array_index,
-        value
+        value,
+        enum_name
     }))
 
 }
