@@ -1,12 +1,14 @@
 use std::{collections::HashMap, io::{Cursor, Read, Result, Seek, SeekFrom}};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+use serde::{Deserialize, Serialize};
 
 use crate::upkreader::{read_string, UPKPak};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum PropertyValue {
+    None,
     Byte(u8),
     Int(i32),
     Bool(bool),
@@ -37,7 +39,7 @@ impl PropertyValue {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Property {
     pub name: String,
     pub prop_type: String,
@@ -157,7 +159,14 @@ pub fn parse_struct(
     size: i32
 ) -> Result<PropertyValue> {
     let struct_name_index = reader.read_i64::<LittleEndian>()?;
-    let struct_name = pak.name_table[struct_name_index as usize].clone();
+    
+    if struct_name_index < 0 || struct_name_index >= pak.name_table.len() as i64 {
+        let mut buf = vec![0u8; size.saturating_sub(8) as usize];
+        reader.read_exact(&mut buf)?;
+        return Ok(PropertyValue::Raw(buf));
+    }
+
+    let struct_name = pak.name_table[struct_name_index as usize].clone(); 
 
     println!("    Struct type: {}", struct_name);
 
@@ -165,6 +174,20 @@ pub fn parse_struct(
 
     match struct_name.as_str() {
         // Todo DisConv structs
+        "Guid" => {
+            let a = reader.read_u32::<LittleEndian>()?;
+            let b = reader.read_u32::<LittleEndian>()?;
+            let c = reader.read_u32::<LittleEndian>()?;
+            let d = reader.read_u32::<LittleEndian>()?;
+
+            let mut props = HashMap::new();
+            props.insert("A".to_string(), PropertyValue::Int(a as i32));
+            props.insert("B".to_string(), PropertyValue::Int(b as i32));
+            props.insert("C".to_string(), PropertyValue::Int(c as i32));
+            props.insert("D".to_string(), PropertyValue::Int(d as i32));
+
+            Ok(PropertyValue::Struct(props))
+        },
         _ => {
             let mut properties = HashMap::new();
 
@@ -185,6 +208,7 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
     let mut init_pos = reader.position();
     let mut name_index = reader.read_i64::<LittleEndian>()?;
 
+    // Todo: make proper regonition of thoose 4 bytes
     if name_index > pak.name_table.len() as i64 && init_pos == 0 {
         init_pos += 4;
         reader.seek(SeekFrom::Start(init_pos))?;

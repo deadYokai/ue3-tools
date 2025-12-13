@@ -2,7 +2,7 @@ use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, See
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
-use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::{parse_property, Property, PropertyValue}};
+use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::{parse_property, Property, PropertyValue}, upkreader::{get_obj_props, UPKPak}};
 use clap::{Parser, Subcommand};
 
 mod upkreader;
@@ -12,10 +12,12 @@ mod fontmod;
 
 // stupid ron parser
 fn extract_from_ron(ron_path: &str, ron_class: &str) -> String {
-    let ron_file = fs::read_to_string(ron_path).unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
+    let ron_file = fs::read_to_string(ron_path)
+        .unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
     
     let fmt = format!("{ron_class}(");
-    let start = ron_file.find(&fmt).unwrap_or_else(|| panic!("`{}` not found in file", ron_class));
+    let start = ron_file.find(&fmt)
+        .unwrap_or_else(|| panic!("`{}` not found in file", ron_class));
     
     let mut depth = 1;
     let mut end = start + fmt.len();
@@ -110,37 +112,6 @@ fn getlist(path: &str) -> Result<()>
     Ok(())
 }
 
-fn el(path: &str, ron_path: &str, print_out: bool) -> Result<Vec<Property>>
-{
-    if path.is_empty()
-    {
-        println!("No object file provided");
-        exit(-1);
-    }
-
-    if ron_path.is_empty()
-    {
-        println!("No `.ron` file provided");
-        exit(-1);
-    }
-
-    let upk: upkreader::UPKPak = ron::from_str(&extract_from_ron(ron_path, "UPKPak")).expect("RON Error");
-
-
-    let el_data = fs::read(path)?;
-    let mut cursor = Cursor::new(&el_data);
-
-    let mut props = Vec::new();
-    while let Some(prop) = parse_property(&mut cursor, &upk)? {
-        if print_out {
-            println!("{:?}", prop);
-        }
-        props.push(prop);
-    }
-
-    Ok(props)    
-}
-
 fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
 {
 
@@ -210,23 +181,23 @@ fn pack_upk(_ron_path: &str) -> Result<()> {
     unimplemented!("For now");
 }
 
-fn swffont(path: &str, ron_path: &str) -> Result<()> {
-    let props = el(path, ron_path, false)?;
-    
-    let rawdata_find: &Property = props.iter().find(|s| s.name == "RawData").unwrap();
-    let rawdata = rawdata_find.value.as_vec();
-
-    let file = File::create("test.gfx")?;
-    let mut writer = BufWriter::new(file);
-
-    if let Some(data) = rawdata {
-        for b in data.iter() {
-            if let Some(byte) = b.as_byte() {
-                writer.write_u8(byte)?;
-            }
-        }
+fn print_obj_elements(path: &str, ron_path: &str) -> Result<()> {
+    if path.is_empty()
+    {
+        panic!("No object file provided");
     }
 
+    if ron_path.is_empty()
+    {
+        panic!("No `.ron` file provided");
+    }
+
+    let upk: UPKPak = ron::from_str(&extract_from_ron(ron_path, "UPKPak")).expect("RON Error");
+    let el_data = fs::read(path)?;
+    let mut cursor = Cursor::new(&el_data);
+
+    get_obj_props(&mut cursor, &upk, true)?;
+    
     Ok(())
 }
 
@@ -240,11 +211,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Swffont {
-        path: String,
-        ron_path: String
-    },
-
     #[command(about = "Print header info of upk file")]
     UpkHeader {
         path: String
@@ -289,10 +255,11 @@ fn main() -> Result<()>
 {
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Swffont { path, ron_path } => swffont(&path, &ron_path)?,
+    match cli.command {        
         Commands::UpkHeader { path } => { upk_header_cursor(&path)?; },
-        Commands::Elements { path, ron_path } => { el(&path, &ron_path, true)?; },
+        Commands::Elements { path, ron_path } => { 
+            print_obj_elements(&path, &ron_path)?;
+        },
         Commands::List { path } => getlist(&path)?,
         Commands::Names { path, output_path } => { 
             let out = output_path.as_deref().unwrap_or("");

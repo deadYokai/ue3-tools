@@ -1,8 +1,9 @@
-use std::{fmt, fs::File, io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::Path};
-use byteorder::{LittleEndian, ReadBytesExt};
+use std::{fmt, fs::{self, File}, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::Path};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use ron::ser::{to_string_pretty, PrettyConfig};
 use serde::{Serialize, Deserialize};
 
-use crate::upkdecompress::CompressionMethod;
+use crate::{upkdecompress::CompressionMethod, upkprops::{self, Property}};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Names
@@ -76,6 +77,7 @@ pub struct UpkHeader
     pub import_count: i32,
     pub import_offset: i32,
     pub depends_offset: i32,
+    pub is_unks: bool,
     pub unk: [i32; 4],
     pub guid: [i32; 4],
     pub gen_count: i32,
@@ -259,6 +261,63 @@ pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String>
         .collect()
 }
 
+pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()> {
+    
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap();
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap();
+    let dir = path.parent().unwrap();
+    let new_path = dir.join(name);
+
+    match ext {
+        "SwfMovie" => {
+            let buf_vec = buf.to_vec();
+            let mut cursor = Cursor::new(&buf_vec);
+            let props = get_obj_props(&mut cursor, pkg, false)?;
+
+            let rawdata_find: &Property = props.iter().find(|s| s.name == "RawData").unwrap();
+            let rawdata = rawdata_find.value.as_vec();
+
+            let mut file_buffer = Vec::<u8>::new();
+            
+            {
+                let mut writer = BufWriter::new(&mut file_buffer);
+
+                if let Some(data) = rawdata {
+                    for b in data.iter() {
+                        if let Some(byte) = b.as_byte() {
+                            writer.write_u8(byte)?;
+                        }
+                    }
+                }
+
+                writer.flush()?;
+            }
+
+            if file_buffer.is_empty() {
+                let mut out_file = File::create(path)?;
+                out_file.write_all(buf)?;
+            } else {
+                let filtered: Vec<_> = props.iter().filter(|s| s.name != "RawData")
+                    .collect();
+                let pretty = PrettyConfig::new().struct_names(true);
+                let ron_string = to_string_pretty(&filtered, pretty).unwrap();
+
+                let mut ron_file = File::create(new_path.with_extension("ron"))?;
+                writeln!(ron_file, "{ron_string}")?;
+
+                let mut file = File::create(new_path.with_extension("gfx"))?;
+                file.write_all(&file_buffer)?;
+            }
+        }
+        _ => {
+            let mut out_file = File::create(path)?;
+            out_file.write_all(buf)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: &Path, all: bool) -> Result<()> {
 
     let mut found = false;
@@ -276,8 +335,8 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
             let mut buffer = vec![0u8; exp.obj_filesize as usize];
             cursor.read_exact(&mut buffer)?;
 
-            let mut out_file = File::create(&file_path)?;
-            out_file.write_all(&buffer)?;
+            write_extracted_file(&file_path, &buffer, pkg)?;
+            println!("{}", i32::from_le_bytes(buffer[0..4].try_into().unwrap()));
 
             println!("Exported {} ({} bytes) to {}", full_path, buffer.len(), file_path.display());
             found = true;
@@ -349,7 +408,6 @@ pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<Names>
     }
 }
 
-
 pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
 {
     let len = cursor.read_i32::<LittleEndian>()?;
@@ -388,6 +446,23 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
         String::from_utf16(utf16_trimmed)
             .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"))
     }
+}
+
+pub fn get_obj_props(
+    cursor: &mut Cursor<&Vec<u8>>,
+    upk: &UPKPak,
+    print_out: bool
+) -> Result<Vec<Property>>
+{
+    let mut props = Vec::new();
+    while let Some(prop) = upkprops::parse_property(cursor, upk)? {
+        if print_out {
+            println!("{:?}", prop);
+        }
+        props.push(prop);
+    }
+
+    Ok(props)    
 }
 
 impl fmt::Display for UpkHeader 
@@ -464,8 +539,10 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
     }
 
     let mut unks = [0; 4];
+    let mut is_unks = false;
 
     if p_ver >= 801 { // found in Dishonored, Batman: Arkham City
+        is_unks = true;
         unks =
             [
             reader.read_i32::<LittleEndian>()?,
@@ -519,6 +596,7 @@ pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
         import_count: ic,
         import_offset: io,
         depends_offset: depo,
+        is_unks,
         unk: unks,
         guid: gid,
         gen_count: gc,
