@@ -3,7 +3,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{to_string_pretty, PrettyConfig};
 use serde::{Serialize, Deserialize};
 
-use crate::{upkdecompress::CompressionMethod, upkprops::{self, Property}};
+use crate::{upkdecompress::CompressionMethod, upkprops::{self, Property, PropertyValue}};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Names
@@ -272,7 +272,7 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()>
         "SwfMovie" => {
             let buf_vec = buf.to_vec();
             let mut cursor = Cursor::new(&buf_vec);
-            let props = get_obj_props(&mut cursor, pkg, false)?;
+            let mut props = get_obj_props(&mut cursor, pkg, false)?;
 
             let rawdata_find: &Property = props.iter().find(|s| s.name == "RawData").unwrap();
             let rawdata = rawdata_find.value.as_vec();
@@ -297,10 +297,16 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()>
                 let mut out_file = File::create(path)?;
                 out_file.write_all(buf)?;
             } else {
-                let filtered: Vec<_> = props.iter().filter(|s| s.name != "RawData")
-                    .collect();
-                let pretty = PrettyConfig::new().struct_names(true);
-                let ron_string = to_string_pretty(&filtered, pretty).unwrap();
+                // let filtered: Vec<_> = props.iter().filter(|s| s.name != "RawData")
+                //     .collect();
+                for prop in props.iter_mut() {
+                    if prop.name == "RawData" {
+                        prop.value = PropertyValue::String(format!("{}.gfx", name));
+                    }
+                }
+                let config = PrettyConfig::new().struct_names(true);
+                let data = (format!("{}.{}", name, ext), &props);
+                let ron_string = to_string_pretty(&data, config).unwrap();
 
                 let mut ron_file = File::create(new_path.with_extension("ron"))?;
                 writeln!(ron_file, "{ron_string}")?;
@@ -336,7 +342,8 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
             cursor.read_exact(&mut buffer)?;
 
             write_extracted_file(&file_path, &buffer, pkg)?;
-            println!("{}", i32::from_le_bytes(buffer[0..4].try_into().unwrap()));
+            let _unk_idx = i32::from_le_bytes(buffer[0..4].try_into().unwrap());
+           
 
             println!("Exported {} ({} bytes) to {}", full_path, buffer.len(), file_path.display());
             found = true;

@@ -7,9 +7,11 @@ edition = "2024"
 anyhow = "1.0.99"
 byteorder = "1.5.0"
 clap = { version = "4.5.53", features = ["derive"] }
+dds-rs = "0.7.0"
 flate2 = "1.1.2"
 freetype-rs = "0.38.0"
 libc = "0.2.177"
 lzo-sys = "1.0.0"
 ron = "0.11.0"
+rusttype = "0.9.3"
 serde = { version = "1.0.224", features = ["derive"] }

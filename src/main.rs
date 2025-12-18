@@ -1,47 +1,15 @@
 use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
-use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkprops::{parse_property, Property, PropertyValue}, upkreader::{get_obj_props, UPKPak}};
+use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkreader::{get_obj_props, UPKPak, UpkHeader}};
 use clap::{Parser, Subcommand};
 
 mod upkreader;
+mod upkpacker;
 mod upkdecompress;
 mod upkprops;
-mod fontmod;
-
-// stupid ron parser
-fn extract_from_ron(ron_path: &str, ron_class: &str) -> String {
-    let ron_file = fs::read_to_string(ron_path)
-        .unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
-    
-    let fmt = format!("{ron_class}(");
-    let start = ron_file.find(&fmt)
-        .unwrap_or_else(|| panic!("`{}` not found in file", ron_class));
-    
-    let mut depth = 1;
-    let mut end = start + fmt.len();
-
-    for (i, c) in ron_file[end..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end += i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if depth != 0 {
-        panic!("Something wrong, when parsing ron file for `{ron_class}`");
-    }
-
-    ron_file[start..end].to_string()
-}
+mod upkfont;
 
 fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
 {
@@ -164,13 +132,14 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
     
     let mut data_file = File::create(pbuf.with_extension("ron"))?;
 
-    let pretty = PrettyConfig::new().struct_names(true);
+    let config = PrettyConfig::new().struct_names(true);
 
-    let s = to_string_pretty(&header, pretty.clone()).expect("Fail");
+    let tup = (&header, &up);
+    let s = to_string_pretty(&tup, config).expect("Fail");
     writeln!(data_file, "{s}")?;
 
-    let s = to_string_pretty(&up, pretty).expect("Fail");
-    writeln!(data_file, "{s}")?;
+    // let s = to_string_pretty(&up, pretty).expect("Fail");
+    // writeln!(data_file, "{s}")?;
 
     upkreader::extract_by_name(&mut cursor, &up, path, dir_path, all)?;
 
@@ -192,7 +161,11 @@ fn print_obj_elements(path: &str, ron_path: &str) -> Result<()> {
         panic!("No `.ron` file provided");
     }
 
-    let upk: UPKPak = ron::from_str(&extract_from_ron(ron_path, "UPKPak")).expect("RON Error");
+    let ron_file = fs::read_to_string(ron_path)
+        .unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
+    let ron_data: (UpkHeader, UPKPak) = ron::from_str(&ron_file).expect("RON Error");
+    
+    let upk: UPKPak = ron_data.1;
     let el_data = fs::read(path)?;
     let mut cursor = Cursor::new(&el_data);
 
