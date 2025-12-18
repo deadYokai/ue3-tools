@@ -276,6 +276,7 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()>
 
             let rawdata_find: &Property = props.iter().find(|s| s.name == "RawData").unwrap();
             let rawdata = rawdata_find.value.as_vec();
+            // let rawdata = &rawdata_find.value;
 
             let mut file_buffer = Vec::<u8>::new();
             
@@ -288,8 +289,10 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()>
                             writer.write_u8(byte)?;
                         }
                     }
+                    
                 }
 
+                // rawdata.write_all(&mut writer)?;
                 writer.flush()?;
             }
 
@@ -462,11 +465,19 @@ pub fn get_obj_props(
 ) -> Result<Vec<Property>>
 {
     let mut props = Vec::new();
-    while let Some(prop) = upkprops::parse_property(cursor, upk)? {
+    while let Some(prop) = upkprops::parse_property(cursor, upk).expect("get_obj_props") {
+        let start_pos = cursor.position();
+        
         if print_out {
             println!("{:?}", prop);
         }
+
         props.push(prop);
+
+        if cursor.position() >= cursor.seek(std::io::SeekFrom::End(0))?{
+            break;
+        }
+        cursor.seek(std::io::SeekFrom::Start(start_pos))?;
     }
 
     Ok(props)    

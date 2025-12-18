@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::{Cursor, Read, Result, Seek, SeekFrom}};
+use std::{collections::HashMap, io::{Cursor, Read, Result, Seek, SeekFrom, Write}};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,39 @@ impl PropertyValue {
             None
         }
     }
+
+    pub fn write_all<W: Write>(&self, writer: &mut W) -> Result<()> {
+        match self {
+            PropertyValue::None => unreachable!(),
+            PropertyValue::Byte(b) => writer.write_all(&[*b])?,
+            PropertyValue::Int(i) => writer.write_all(&i.to_le_bytes())?,
+            PropertyValue::Bool(b) => writer.write_all(&[if *b {1u8} else {0u8}])?,
+            PropertyValue::Float(f) => writer.write_all(&f.to_le_bytes())?,
+            PropertyValue::Object(id) => writer.write_all(&id.to_le_bytes())?,
+            PropertyValue::Raw(data) => writer.write_all(data)?,
+            PropertyValue::Name(_) => {
+                todo!();
+            },
+            PropertyValue::String(_) => {
+                todo!();
+            },
+            PropertyValue::Array(_) => {
+                todo!()
+            },
+            PropertyValue::Struct(_) => {
+                todo!()
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_all(&mut buf).expect("");
+        buf
+    }
+    
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +80,12 @@ pub struct Property {
     pub array_index: i32,
     pub value: PropertyValue,
     pub enum_name: Option<String>
+}
+
+impl Property {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        todo!()
+    }
 }
 
 pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Result<PropertyValue> {
@@ -80,10 +119,10 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
     let bytes_per_element = remaining_bytes / count as u64;
 
     let mut elements = Vec::with_capacity(count as usize);
-
+    
     match bytes_per_element {
         1 => {
-            for _ in 0..count {
+            for _ in 0..count{
                 let val = reader.read_u8()?;
                 elements.push(PropertyValue::Byte(val));
             }
@@ -143,6 +182,7 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
                 }
             }
         }
+
     }
 
     let bytes_consumed = reader.position();
@@ -206,6 +246,7 @@ pub fn parse_struct(
 
 pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Option<Property>>{
     let mut init_pos = reader.position();
+
     let mut name_index = reader.read_i64::<LittleEndian>()?;
 
     // Todo: make proper regonition of thoose 4 bytes
@@ -222,7 +263,14 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
     let prop_name = pak.name_table[name_index as usize].clone();
 
     if prop_name == "None" {
-        return Ok(None);
+        return Ok(Some(Property {
+            name: prop_name.clone(),
+            prop_type: prop_name,
+            size: -1,
+            array_index: -1,
+            value: PropertyValue::None,
+            enum_name: None
+        }));
     }
 
     let type_index = reader.read_i64::<LittleEndian>()?;
