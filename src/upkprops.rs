@@ -18,7 +18,8 @@ pub enum PropertyValue {
     String(String),
     Array(Vec<PropertyValue>),
     Struct(HashMap<String, PropertyValue>),
-    Raw(Vec<u8>)
+    Raw(Vec<u8>),
+    Generation(i32)
 }
 
 impl PropertyValue {
@@ -42,7 +43,7 @@ impl PropertyValue {
         match self {
             PropertyValue::None => unreachable!(),
             PropertyValue::Byte(b) => writer.write_all(&[*b])?,
-            PropertyValue::Int(i) => writer.write_all(&i.to_le_bytes())?,
+            PropertyValue::Int(i) | PropertyValue::Generation(i) => writer.write_all(&i.to_le_bytes())?,
             PropertyValue::Bool(b) => writer.write_all(&[if *b {1u8} else {0u8}])?,
             PropertyValue::Float(f) => writer.write_all(&f.to_le_bytes())?,
             PropertyValue::Object(id) => writer.write_all(&id.to_le_bytes())?,
@@ -92,7 +93,7 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
     let start_pos = reader.position();
     let count = reader.read_i32::<LittleEndian>()?;
 
-    println!("  Array count: {}", count);
+    // println!("  Array count: {}", count);
 
     if count < 0 {
         println!("  ERR: invalid array count: {}", count);
@@ -104,20 +105,20 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
     }
 
     if count > 1_000_000 {
-        println!("  Warning! Sus large array!");
+        // println!("  Warning! Sus large array!");
         return Ok(PropertyValue::Array(Vec::new()));
     }
 
-    let bytes_read = reader.position() - start_pos;
-    let remaining_bytes = (size as u64).saturating_sub(bytes_read);
+    let remaining_bytes = (size as u64).saturating_sub(4);
 
     if remaining_bytes == 0 {
-        println!("  Warning: No data in array elements");
+        // println!("  Warning: No data in array elements");
         return Ok(PropertyValue::Array(Vec::new()));
     }
 
     let bytes_per_element = remaining_bytes / count as u64;
 
+    // println!("  BPE: {}", bytes_per_element);
     let mut elements = Vec::with_capacity(count as usize);
     
     match bytes_per_element {
@@ -185,10 +186,10 @@ pub fn parse_array(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak, size: i32) -> Re
 
     }
 
-    let bytes_consumed = reader.position();
-    if bytes_consumed != size as u64 {
-        println!("  Warning: size mismatch - expected {}, consumed {}", size, bytes_consumed);
-    }
+    // let bytes_consumed = reader.position() - start_pos;
+    // if bytes_consumed != size as u64 {
+    //     println!("  Warning: size mismatch - expected {}, consumed {}", size, bytes_consumed);
+    // }
     
     Ok(PropertyValue::Array(elements))
 }
@@ -246,15 +247,19 @@ pub fn parse_struct(
 
 pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Option<Property>>{
     let mut init_pos = reader.position();
+    
+    if init_pos == 0 {
+        return Ok(Some(Property {
+            name: "Generation".to_string(),
+            prop_type: "unknown shit".to_string(),
+            size: -1,
+            array_index: -1,
+            value: PropertyValue::Generation(reader.read_i32::<LittleEndian>()?),
+            enum_name: None
+        }));
+    }
 
     let mut name_index = reader.read_i64::<LittleEndian>()?;
-
-    // Todo: make proper regonition of thoose 4 bytes
-    if name_index > pak.name_table.len() as i64 && init_pos == 0 {
-        init_pos += 4;
-        reader.seek(SeekFrom::Start(init_pos))?;
-        name_index = reader.read_i64::<LittleEndian>()?;
-    }
 
     if name_index == 0 || name_index > pak.name_table.len() as i64 {
         return Ok(None);

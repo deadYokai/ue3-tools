@@ -1,4 +1,4 @@
-use std::{fmt, fs::{self, File}, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::Path};
+use std::{fmt, fs::File, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::{Path, PathBuf}};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{to_string_pretty, PrettyConfig};
 use serde::{Serialize, Deserialize};
@@ -261,14 +261,26 @@ pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String>
         .collect()
 }
 
-pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()> {
+pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<PathBuf> {
     
     let ext = path.extension().and_then(|s| s.to_str()).unwrap();
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap();
     let dir = path.parent().unwrap();
-    let new_path = dir.join(name);
+    let mut new_path = dir.join(name);
 
     match ext {
+        "ObjectReferencer" => {
+            let buf_vec = buf.to_vec();
+            let mut cursor = Cursor::new(&buf_vec);
+            let props = get_obj_props(&mut cursor, pkg, false)?;
+            let config = PrettyConfig::new().struct_names(true);
+            let data = (format!("{}.{}", name, ext), &props);
+            let ron_string = to_string_pretty(&data, config).unwrap();
+
+            new_path = new_path.with_extension("ron");
+            let mut ron_file = File::create(&new_path)?;
+            writeln!(ron_file, "{ron_string}")?;
+        },
         "SwfMovie" => {
             let buf_vec = buf.to_vec();
             let mut cursor = Cursor::new(&buf_vec);
@@ -298,6 +310,7 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()>
 
             if file_buffer.is_empty() {
                 let mut out_file = File::create(path)?;
+                new_path = path.to_path_buf();
                 out_file.write_all(buf)?;
             } else {
                 // let filtered: Vec<_> = props.iter().filter(|s| s.name != "RawData")
@@ -314,17 +327,19 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<()>
                 let mut ron_file = File::create(new_path.with_extension("ron"))?;
                 writeln!(ron_file, "{ron_string}")?;
 
-                let mut file = File::create(new_path.with_extension("gfx"))?;
+                new_path = new_path.with_extension("gfx");
+                let mut file = File::create(&new_path)?;
                 file.write_all(&file_buffer)?;
             }
         }
         _ => {
             let mut out_file = File::create(path)?;
+            new_path = path.to_path_buf();
             out_file.write_all(buf)?;
         }
     }
 
-    Ok(())
+    Ok(new_path)
 }
 
 pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: &Path, all: bool) -> Result<()> {
@@ -344,11 +359,9 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
             let mut buffer = vec![0u8; exp.obj_filesize as usize];
             cursor.read_exact(&mut buffer)?;
 
-            write_extracted_file(&file_path, &buffer, pkg)?;
-            let _unk_idx = i32::from_le_bytes(buffer[0..4].try_into().unwrap());
-           
+            let out_path = write_extracted_file(&file_path, &buffer, pkg)?; 
 
-            println!("Exported {} ({} bytes) to {}", full_path, buffer.len(), file_path.display());
+            println!("Exported \x1b[93m{}\x1b[0m (\x1b[33m{}\x1b[0m bytes) to\n\t \x1b[32m{}\x1b[0m", full_path, buffer.len(), out_path.display());
             found = true;
         }
     }

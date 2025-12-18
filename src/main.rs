@@ -147,7 +147,7 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
 
     let config = PrettyConfig::new().struct_names(true);
 
-    let tup = (filename, upk_path, &header, &up);
+    let tup = (&filename.to_str().unwrap(), &upk_path, &header, &up);
     let s = to_string_pretty(&tup, config).expect("Fail");
     writeln!(data_file, "{s}")?;
 
@@ -163,7 +163,7 @@ fn pack_upk(_ron_path: &str) -> Result<()> {
     unimplemented!("For now");
 }
 
-fn print_obj_elements(path: &str, ron_path: &str) -> Result<()> {
+fn print_obj_elements(ron_path: &str, path: &str) -> Result<()> {
     if path.is_empty()
     {
         panic!("No object file provided");
@@ -204,8 +204,8 @@ enum Commands {
 
     #[command(about = "Print elements in object")]
     Elements {
-        path: String,
-        ron_path: String
+        ron_path: String,
+        path: String
     },
 
     #[command(about = "Print list of objects in upk file")]
@@ -244,7 +244,7 @@ fn main() -> Result<()>
     match cli.command {        
         Commands::UpkHeader { path } => { upk_header_cursor(&path)?; },
         Commands::Elements { ron_path, path } => { 
-            print_obj_elements(&path, &ron_path)?;
+            print_obj_elements(&ron_path, &path)?;
         },
         Commands::List { path } => getlist(&path)?,
         Commands::Names { path, output_path } => { 
