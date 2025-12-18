@@ -1,5 +1,5 @@
 use std::{io::{self, BufReader, Read}, ptr};
-use lzo_sys::{lzo1x::lzo1x_decompress, lzoconf::LZO_E_OK};
+use lzo_sys::{lzo1x::lzo1x_decompress_safe, lzoconf::LZO_E_OK};
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Copy, Clone)]
 #[repr(u32)]
@@ -45,9 +45,12 @@ pub fn decompress_chunk<R: Read>(
     let mut out = vec![0u8; expected_decompress_size];
     let mut out_len = expected_decompress_size;
 
+    println!("Compressed data (first 32 bytes): {:02x?}", &compressed[..32.min(compressed.len())]);
+    println!("Sizes - compressed: {}, expected decompressed: {}", compressed_size, expected_decompress_size);
+
     if mode == CompressionMethod::Zlo {
         let result = unsafe {
-            lzo1x_decompress(
+            lzo1x_decompress_safe(
                 compressed.as_ptr(),
                 compressed.len(),
                 out.as_mut_ptr(),

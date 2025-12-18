@@ -27,7 +27,7 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
     {
 
         if header.compressed_chunks != 0 {
-            let mut chunks = Vec::new();
+            let mut chunks = Vec::with_capacity(header.compressed_chunks as usize);
             for _ in 0..header.compressed_chunks {
                 chunks.push(CompressedChunk{
                     decompressed_offset: reader.read_u32::<LittleEndian>()?,
@@ -39,19 +39,32 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
             println!("Compressed chunks: {:?}", chunks);
 
             let mut dec_data: Vec<u8> = Vec::new(); 
-            if header.compression == CompressionMethod::Zlo {
-                for chunk in chunks {
+            if header.compression == CompressionMethod::Zlo {                
+                reader.seek(SeekFrom::Start(0))?;
+                reader.read_to_end(&mut dec_data)?;
+
+                for chunk in &chunks {
                     reader.seek(SeekFrom::Start(chunk.compressed_offset as u64))?;
-                    dec_data = decompress_chunk(
+                    let chunk_data = decompress_chunk(
                         &mut reader,
                         chunk.compressed_size as usize,
                         header.compression,
                         chunk.decompressed_size as usize
                     )?;
+
+                    let end = chunk.decompressed_offset as usize +
+                        chunk.decompressed_size as usize;
+
+                    if dec_data.len() < end {
+                        dec_data.resize(end, 0);
+                    }
+
+                    dec_data[chunk.decompressed_offset as usize..end]
+                        .copy_from_slice(&chunk_data);
                 }
             }
 
-            let file = File::create("../test.upk")?;
+            let file = File::create("test.upk")?;
             let mut writer = BufWriter::new(file);
             writer.write_all(&dec_data)?;
         }
@@ -134,7 +147,7 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
 
     let config = PrettyConfig::new().struct_names(true);
 
-    let tup = (&header, &up);
+    let tup = (filename, upk_path, &header, &up);
     let s = to_string_pretty(&tup, config).expect("Fail");
     writeln!(data_file, "{s}")?;
 
@@ -163,9 +176,9 @@ fn print_obj_elements(path: &str, ron_path: &str) -> Result<()> {
 
     let ron_file = fs::read_to_string(ron_path)
         .unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
-    let ron_data: (UpkHeader, UPKPak) = ron::from_str(&ron_file).expect("RON Error");
+    let ron_data: (String, String, UpkHeader, UPKPak) = ron::from_str(&ron_file).expect("RON Error");
     
-    let upk: UPKPak = ron_data.1;
+    let upk: UPKPak = ron_data.3;
     let el_data = fs::read(path)?;
     let mut cursor = Cursor::new(&el_data);
 
@@ -230,7 +243,7 @@ fn main() -> Result<()>
 
     match cli.command {        
         Commands::UpkHeader { path } => { upk_header_cursor(&path)?; },
-        Commands::Elements { path, ron_path } => { 
+        Commands::Elements { ron_path, path } => { 
             print_obj_elements(&path, &ron_path)?;
         },
         Commands::List { path } => getlist(&path)?,
