@@ -2,7 +2,7 @@ use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, See
 use byteorder::{LittleEndian, ReadBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
-use crate::{upkdecompress::{decompress_chunk, CompressedChunk, CompressionMethod}, upkreader::{get_obj_props, UPKPak, UpkHeader}};
+use crate::{upkdecompress::{upk_decompress, CompressedChunk, CompressionMethod}, upkreader::{get_obj_props, UPKPak, UpkHeader}};
 use clap::{Parser, Subcommand};
 
 mod upkreader;
@@ -28,6 +28,7 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
         if header.compressed_chunks != 0 {
             let mut chunks = Vec::with_capacity(header.compressed_chunks as usize);
+
             for _ in 0..header.compressed_chunks {
                 chunks.push(CompressedChunk{
                     decompressed_offset: reader.read_u32::<LittleEndian>()?,
@@ -36,34 +37,14 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
                     compressed_size: reader.read_u32::<LittleEndian>()?,
                 });
             }
+            
+            chunks.sort_by_key(|c| c.decompressed_offset);
+
             println!("Compressed chunks: {:?}", chunks);
 
-            let mut dec_data: Vec<u8> = Vec::new(); 
-            if header.compression == CompressionMethod::Zlo {                
-                reader.seek(SeekFrom::Start(0))?;
-                reader.read_to_end(&mut dec_data)?;
-
-                for chunk in &chunks {
-                    reader.seek(SeekFrom::Start(chunk.compressed_offset as u64))?;
-                    let chunk_data = decompress_chunk(
-                        &mut reader,
-                        chunk.compressed_size as usize,
-                        header.compression,
-                        chunk.decompressed_size as usize
-                    )?;
-
-                    let end = chunk.decompressed_offset as usize +
-                        chunk.decompressed_size as usize;
-
-                    if dec_data.len() < end {
-                        dec_data.resize(end, 0);
-                    }
-
-                    dec_data[chunk.decompressed_offset as usize..end]
-                        .copy_from_slice(&chunk_data);
-                }
-            }
-
+            let dec_data = upk_decompress(&mut reader, header.compression, &chunks)
+                .expect("Decompression error"); 
+ 
             let file = File::create("test.upk")?;
             let mut writer = BufWriter::new(file);
             writer.write_all(&dec_data)?;

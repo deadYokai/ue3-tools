@@ -246,8 +246,8 @@ pub fn parse_struct(
 }
 
 pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Option<Property>>{
-    let mut init_pos = reader.position();
-    
+    let init_pos = reader.position();
+
     if init_pos == 0 {
         return Ok(Some(Property {
             name: "Generation".to_string(),
@@ -259,12 +259,15 @@ pub fn parse_property(reader: &mut Cursor<&Vec<u8>>, pak: &UPKPak) -> Result<Opt
         }));
     }
 
-    let mut name_index = reader.read_i64::<LittleEndian>()?;
+    let name_index = reader.read_i32::<LittleEndian>()?;
 
-    if name_index == 0 || name_index > pak.name_table.len() as i64 {
-        return Ok(None);
+    if reader.read_i32::<LittleEndian>()? != 0{
+        reader.seek(SeekFrom::Current(-4))?;
     }
 
+    if name_index == 0 || name_index > pak.name_table.len() as i32 {
+        return Ok(None);
+    } 
     let prop_name = pak.name_table[name_index as usize].clone();
 
     if prop_name == "None" {
