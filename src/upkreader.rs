@@ -570,12 +570,12 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Name Count: {}", self.name_count)?;
         writeln!(f, "Export Count: {}", self.export_count)?;
         writeln!(f, "Import Count: {}", self.import_count)?;
-        if self.p_ver > 623 {
+        if self.p_ver >= 623 {
             writeln!(f, "Import/Export Guids pos: {}", self.import_export_guids_offset)?;
             writeln!(f, "Import Guids Count: {}", self.import_guids_count)?;
             writeln!(f, "Export Guids Count: {}", self.export_guids_count)?;
         } 
-        if self.p_ver > 584{ 
+        if self.p_ver >= 584{ 
             writeln!(f, "Thumbnail table pos: {}", self.thumbnail_table_offest)?;
         }
         writeln!(f, "GUID: {:x?}", self.guid)?;
@@ -758,12 +758,12 @@ impl UpkHeader {
         writer.write_i32::<LittleEndian>(self.import_offset)?;
         writer.write_i32::<LittleEndian>(self.depends_offset)?;
         
-        if self.p_ver > 623 {
+        if self.p_ver >= 623 {
             writer.write_i32::<LittleEndian>(self.import_export_guids_offset)?;
             writer.write_u32::<LittleEndian>(self.import_guids_count)?;
             writer.write_u32::<LittleEndian>(self.export_guids_count)?;
         } 
-        if self.p_ver > 584{ 
+        if self.p_ver >= 584{ 
             writer.write_u32::<LittleEndian>(self.thumbnail_table_offest)?;
         }
 
