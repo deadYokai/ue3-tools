@@ -1,6 +1,7 @@
 use std::{io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom}};
 
 use byteorder::{LittleEndian, ReadBytesExt};
+use serde::{Deserialize, Serialize};
 
 use crate::upkreader::PACKAGE_TAG;
 
@@ -15,7 +16,7 @@ pub enum CompressionMethod {
     Lzx = 4
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Deserialize, Serialize, Copy)]
 pub struct CompressedChunk
 {
     pub decompressed_offset: u32,
@@ -58,7 +59,8 @@ pub fn upk_decompress<R: Read + Seek>(
 
         if bswap {
             if tag.swap_bytes() != PACKAGE_TAG {
-                return Err(Error::new(ErrorKind::InvalidData, "Invalid tag."));
+                return Err(Error::new(ErrorKind::InvalidData, 
+                        format!("Invalid tag (0x{:04x?})", tag)));
             } else {
                 _summary = _summary.swap_bytes();
                 summary_2 = summary_2.swap_bytes();

@@ -3,7 +3,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{to_string_pretty, PrettyConfig};
 use serde::{Serialize, Deserialize};
 use bitflags::bitflags;
-use crate::{upkdecompress::CompressionMethod, upkprops::{self, Property, PropertyValue}};
+use crate::{upkdecompress::{CompressedChunk, CompressionMethod}, upkprops::{self, Property, PropertyValue}};
 
 pub const PACKAGE_TAG: u32 = 0x9E2A83C1;
 
@@ -141,11 +141,12 @@ pub struct UpkHeader
     pub gens: Vec<GenerationInfo>,
     pub engine_ver: i32,
     pub cooker_ver: i32,
-    pub compression: CompressionMethod, 
-    pub compressed_chunks: u32,
+    pub compression_method: CompressionMethod, 
+    pub compressed_chunks_count: u32,
+    pub compressed_chunks: Vec<CompressedChunk>,
     pub package_source: i32,
     pub additional_packages: i32,
-    pub texture_allocs: i32
+    pub texture_allocs: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -341,7 +342,7 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<Pat
             let mut ron_file = File::create(&new_path)?;
             writeln!(ron_file, "{ron_string}")?;
         },
-        "SwfMovie" => {
+        "SwfMovie" | "GFxMovieInfo" => {
             let buf_vec = buf.to_vec();
             let mut cursor = Cursor::new(&buf_vec);
             let mut props = get_obj_props(&mut cursor, pkg, false)?;
@@ -565,7 +566,7 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Licensee Version: {}", self.l_ver)?;
         writeln!(f, "Header Size: {}", self.header_size)?;
         writeln!(f, "Folder: {:?}", String::from_utf8_lossy(&self.path))?;
-        writeln!(f, "Package Flags: (0x{:08x})", self.pak_flags)?;
+        writeln!(f, "Package Flags (0x{:08x}):", self.pak_flags)?;
         PackageFlags::from_bits_truncate(self.pak_flags).print_flags();
         writeln!(f, "Name Count: {}", self.name_count)?;
         writeln!(f, "Export Count: {}", self.export_count)?;
@@ -593,9 +594,23 @@ impl fmt::Display for UpkHeader
         }
         writeln!(f, "Engine Version: {}", self.engine_ver)?;
         writeln!(f, "Cooker Version: {}", self.cooker_ver)?;
-        writeln!(f, "Compression Flags: {:#?}", self.compression)?;
-        if self.compression != CompressionMethod::None {
-            writeln!(f, "Num of compressed chunks: {}", self.compressed_chunks)?;
+        writeln!(f, "Compression Flags: {:#?}", self.compression_method)?;
+        if self.compression_method != CompressionMethod::None {
+            writeln!(f, "Num of compressed chunks: {}", self.compressed_chunks_count)?;
+            for (i, c) in self.compressed_chunks.iter().enumerate(){
+                writeln!(
+                    f, 
+                    " - Chunk {}:\n\
+                    \x20  * Decompressed offset = {}\n\
+                    \x20  * Decompressed size   = {}\n\
+                    \x20  * Compressed offset   = {}\n\
+                    \x20  * Compressed size     = {}", 
+                    i, c.decompressed_offset,
+                    c.decompressed_size,
+                    c.compressed_offset,
+                    c.compressed_size
+                )?;
+            }
         }
         
         writeln!(f, "Package Source: {}", self.package_source)?;
@@ -689,9 +704,19 @@ impl UpkHeader {
 
         let engine_ver = reader.read_i32::<LittleEndian>()?;
         let cooker_ver = reader.read_i32::<LittleEndian>()?;
-        let compression = 
+        let compression_method = 
             CompressionMethod::try_from(reader.read_u32::<LittleEndian>()?).unwrap();
-        let compressed_chunks = reader.read_u32::<LittleEndian>()?;
+        let compressed_chunks_count = reader.read_u32::<LittleEndian>()?;
+        let mut compressed_chunks: Vec<CompressedChunk> = Vec::with_capacity(compressed_chunks_count as usize);
+
+        for _ in 0..compressed_chunks_count {
+            compressed_chunks.push(CompressedChunk{
+                decompressed_offset: reader.read_u32::<LittleEndian>()?,
+                decompressed_size: reader.read_u32::<LittleEndian>()?,
+                compressed_offset: reader.read_u32::<LittleEndian>()?,
+                compressed_size: reader.read_u32::<LittleEndian>()?,
+            });
+        }
 
         let package_source = reader.read_i32::<LittleEndian>()?;
 
@@ -731,7 +756,8 @@ impl UpkHeader {
             gens,
             engine_ver,
             cooker_ver,
-            compression,
+            compression_method,
+            compressed_chunks_count,
             compressed_chunks,
             package_source,
             additional_packages,
@@ -781,8 +807,18 @@ impl UpkHeader {
 
         writer.write_i32::<LittleEndian>(self.engine_ver)?;
         writer.write_i32::<LittleEndian>(self.cooker_ver)?;
-        writer.write_u32::<LittleEndian>(self.compression as u32)?;
-        writer.write_u32::<LittleEndian>(self.compressed_chunks)?;
+        writer.write_u32::<LittleEndian>(self.compression_method as u32)?;
+        writer.write_u32::<LittleEndian>(self.compressed_chunks_count)?;
+   
+        if self.compressed_chunks_count > 0 {
+            for c in &self.compressed_chunks {
+                writer.write_u32::<LittleEndian>(c.decompressed_offset)?;
+                writer.write_u32::<LittleEndian>(c.decompressed_size)?;
+                writer.write_u32::<LittleEndian>(c.compressed_offset)?;
+                writer.write_u32::<LittleEndian>(c.compressed_size)?;
+            }
+        }
+
         writer.write_i32::<LittleEndian>(self.package_source)?;
 
         if self.p_ver >= 516 {

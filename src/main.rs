@@ -1,4 +1,4 @@
-use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path, process::exit};
+use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
 use byteorder::{LittleEndian, ReadBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
@@ -25,34 +25,25 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
     let end_header_offest = reader.stream_position()? as usize;
      
-    if header.compression != CompressionMethod::None 
+    if header.compression_method != CompressionMethod::None 
     {
 
-        if header.compressed_chunks != 0 {
+        if header.compressed_chunks_count != 0 {
 
             println!("File is compressed, trying decompress...");
 
             let mut cloned_header = header.clone();
-            cloned_header.compression = CompressionMethod::None;
-            cloned_header.compressed_chunks = 0;
+            cloned_header.compression_method = CompressionMethod::None;
+            cloned_header.compressed_chunks_count = 0;
             cloned_header.pak_flags = header.pak_flags & !PackageFlags::StoreCompressed.bits();
 
-            let mut chunks = Vec::with_capacity(header.compressed_chunks as usize);
+            let mut chunks = header.compressed_chunks;
 
-            for _ in 0..header.compressed_chunks {
-                chunks.push(CompressedChunk{
-                    decompressed_offset: reader.read_u32::<LittleEndian>()?,
-                    decompressed_size: reader.read_u32::<LittleEndian>()?,
-                    compressed_offset: reader.read_u32::<LittleEndian>()?,
-                    compressed_size: reader.read_u32::<LittleEndian>()?,
-                });
-            }
-            
             chunks.sort_by_key(|c| c.decompressed_offset);
 
             let first_chunk_offset = chunks[0].compressed_offset as usize;
 
-            let dec_data = upk_decompress(&mut reader, header.compression, &chunks)
+            let dec_data = upk_decompress(&mut reader, header.compression_method, &chunks)
                 .expect("Decompression error"); 
 
             let file = File::create(".tmp.upk")?;
