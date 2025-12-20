@@ -1,8 +1,10 @@
-use std::{io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom}, ptr};
+use std::{io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom}};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::upkreader::PACKAGE_TAG;
+
+pub const CHUNK_SIZE: u32 = 131072;
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Copy, Clone)]
 #[repr(u32)]
@@ -65,7 +67,7 @@ pub fn upk_decompress<R: Read + Seek>(
         }
 
         if chunk_size == PACKAGE_TAG {
-            chunk_size = 131072;
+            chunk_size = CHUNK_SIZE;
         }
 
         let total_count = summary_2.div_ceil(chunk_size);

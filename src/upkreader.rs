@@ -132,15 +132,20 @@ pub struct UpkHeader
     pub import_count: i32,
     pub import_offset: i32,
     pub depends_offset: i32,
-    pub is_unks: bool,
-    pub unk: [i32; 4],
+    pub import_export_guids_offset: i32,
+    pub import_guids_count: u32,
+    pub export_guids_count: u32,
+    pub thumbnail_table_offest: u32,
     pub guid: [i32; 4],
     pub gen_count: i32,
     pub gens: Vec<GenerationInfo>,
     pub engine_ver: i32,
     pub cooker_ver: i32,
     pub compression: CompressionMethod, 
-    pub compressed_chunks: u32
+    pub compressed_chunks: u32,
+    pub package_source: i32,
+    pub additional_packages: i32,
+    pub texture_allocs: i32
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -565,11 +570,13 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Name Count: {}", self.name_count)?;
         writeln!(f, "Export Count: {}", self.export_count)?;
         writeln!(f, "Import Count: {}", self.import_count)?;
-        writeln!(f, "Engine Version: {}", self.engine_ver)?;
-        writeln!(f, "Cooker Version: {}", self.cooker_ver)?;
-        writeln!(f, "Compression Flags: {:#?}", self.compression)?;
-        if self.compression != CompressionMethod::None {
-            writeln!(f, "Num of compressed chunks: {}", self.compressed_chunks)?;
+        if self.p_ver > 623 {
+            writeln!(f, "Import/Export Guids pos: {}", self.import_export_guids_offset)?;
+            writeln!(f, "Import Guids Count: {}", self.import_guids_count)?;
+            writeln!(f, "Export Guids Count: {}", self.export_guids_count)?;
+        } 
+        if self.p_ver > 584{ 
+            writeln!(f, "Thumbnail table pos: {}", self.thumbnail_table_offest)?;
         }
         writeln!(f, "GUID: {:x?}", self.guid)?;
         if self.gen_count > 0
@@ -580,9 +587,25 @@ impl fmt::Display for UpkHeader
         {
             writeln!(
                 f, 
-                "\tGen {}:\n\t\tExports={}\n\t\tNames={}\n\t\tNetObjs={}", 
+                " - Gen {}:\n   * Exports = {}\n   * Names   = {}\n   * NetObjs = {}", 
                 i, gens.export_count, gens.name_count, gens.net_obj_count
             )?;
+        }
+        writeln!(f, "Engine Version: {}", self.engine_ver)?;
+        writeln!(f, "Cooker Version: {}", self.cooker_ver)?;
+        writeln!(f, "Compression Flags: {:#?}", self.compression)?;
+        if self.compression != CompressionMethod::None {
+            writeln!(f, "Num of compressed chunks: {}", self.compressed_chunks)?;
+        }
+        
+        writeln!(f, "Package Source: {}", self.package_source)?;
+
+        if self.p_ver >= 516 {
+            writeln!(f, "Additional packages: {}", self.additional_packages)?;
+        }
+
+        if self.p_ver >= 767 {
+            writeln!(f, "Texture Allocations: {}", self.texture_allocs)?;
         }
 
         Ok(())
@@ -625,19 +648,20 @@ impl UpkHeader {
         {
             return Err(Error::new(ErrorKind::InvalidData, "Corrupted pak"));
         }
+        
+        let mut import_export_guids_offset = -1;
+        let mut import_guids_count = 0;
+        let mut export_guids_count = 0;
+        let mut thumbnail_table_offest = 0;
+        
+        if p_ver >= 623 {
+            import_export_guids_offset = reader.read_i32::<LittleEndian>()?;
+            import_guids_count = reader.read_u32::<LittleEndian>()?;
+            export_guids_count = reader.read_u32::<LittleEndian>()?;
+        }
 
-        let mut unk = [0; 4];
-        let mut is_unks = false;
-
-        if p_ver >= 801 { // found in Dishonored, Batman: Arkham City
-            is_unks = true;
-            unk =
-                [
-                reader.read_i32::<LittleEndian>()?,
-                reader.read_i32::<LittleEndian>()?,
-                reader.read_i32::<LittleEndian>()?,
-                reader.read_i32::<LittleEndian>()?,
-                ];
+        if p_ver >= 584{ 
+            thumbnail_table_offest = reader.read_u32::<LittleEndian>()?;
         }
 
         let guid =
@@ -669,6 +693,19 @@ impl UpkHeader {
             CompressionMethod::try_from(reader.read_u32::<LittleEndian>()?).unwrap();
         let compressed_chunks = reader.read_u32::<LittleEndian>()?;
 
+        let package_source = reader.read_i32::<LittleEndian>()?;
+
+        let mut additional_packages = -1;
+        let mut texture_allocs = -1;
+
+        if p_ver >= 516 {
+            additional_packages = reader.read_i32::<LittleEndian>()?;
+        }
+
+        if p_ver >= 767 {
+            texture_allocs = reader.read_i32::<LittleEndian>()?;
+        }
+
         let header = UpkHeader
         {
             sign,
@@ -685,15 +722,20 @@ impl UpkHeader {
             import_count,
             import_offset,
             depends_offset,
-            is_unks,
-            unk,
+            import_export_guids_offset,
+            import_guids_count,
+            export_guids_count,
+            thumbnail_table_offest,
             guid,
             gen_count,
             gens,
             engine_ver,
             cooker_ver,
             compression,
-            compressed_chunks
+            compressed_chunks,
+            package_source,
+            additional_packages,
+            texture_allocs
         };
 
         Ok(header)
@@ -715,11 +757,14 @@ impl UpkHeader {
         writer.write_i32::<LittleEndian>(self.import_count)?;
         writer.write_i32::<LittleEndian>(self.import_offset)?;
         writer.write_i32::<LittleEndian>(self.depends_offset)?;
-
-        if self.is_unks {
-            for v in &self.unk {
-                writer.write_i32::<LittleEndian>(*v)?;
-            }
+        
+        if self.p_ver > 623 {
+            writer.write_i32::<LittleEndian>(self.import_export_guids_offset)?;
+            writer.write_u32::<LittleEndian>(self.import_guids_count)?;
+            writer.write_u32::<LittleEndian>(self.export_guids_count)?;
+        } 
+        if self.p_ver > 584{ 
+            writer.write_u32::<LittleEndian>(self.thumbnail_table_offest)?;
         }
 
         for v in &self.guid {
@@ -738,6 +783,15 @@ impl UpkHeader {
         writer.write_i32::<LittleEndian>(self.cooker_ver)?;
         writer.write_u32::<LittleEndian>(self.compression as u32)?;
         writer.write_u32::<LittleEndian>(self.compressed_chunks)?;
+        writer.write_i32::<LittleEndian>(self.package_source)?;
+
+        if self.p_ver >= 516 {
+            writer.write_i32::<LittleEndian>(self.additional_packages)?;
+        }
+
+        if self.p_ver >= 767 {
+            writer.write_i32::<LittleEndian>(self.texture_allocs)?;
+        }
 
         Ok(())
     }
