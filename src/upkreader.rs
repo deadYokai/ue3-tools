@@ -52,7 +52,7 @@ pub struct Import
     unk3: i32
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GenerationInfo
 {
     export_count: i32,
@@ -60,7 +60,7 @@ pub struct GenerationInfo
     net_obj_count: i32
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UpkHeader
 {
     pub sign: u32,
@@ -533,111 +533,157 @@ impl fmt::Display for UpkHeader
     }
 }
 
-pub fn upk_read_header<R: Read + Seek>(mut reader: R) -> Result<UpkHeader>
-{
-    let sign = reader.read_u32::<LittleEndian>()?;
-    if sign != 0x9E2A83C1
+impl UpkHeader {
+    pub fn read<R: Read + Seek>(mut reader: R) -> Result<Self>
     {
-        return Err(Error::new(ErrorKind::InvalidData, format!("Invalid file signature, sig=0x{:X}", sign)));
-    }
+        let sign = reader.read_u32::<LittleEndian>()?;
+        if sign != 0x9E2A83C1
+        {
+            return Err(Error::new(ErrorKind::InvalidData, format!("Invalid file signature, sig=0x{:X}", sign)));
+        }
 
-    let p_ver = reader.read_i16::<LittleEndian>()?;
-    let l_ver = reader.read_i16::<LittleEndian>()?;
-    let header_size = reader.read_i32::<LittleEndian>()?;
+        let p_ver = reader.read_i16::<LittleEndian>()?;
+        let l_ver = reader.read_i16::<LittleEndian>()?;
+        let header_size = reader.read_i32::<LittleEndian>()?;
 
-    let fl = reader.read_i32::<LittleEndian>()?;
-    let mut rfl = fl;
-    if fl < 0
-    {
-        rfl = fl * -2; // needed if utf16
-    }
-    let mut pn = vec![0u8; rfl as usize];
-    reader.read_exact(&mut pn)?;
+        let path_len = reader.read_i32::<LittleEndian>()?;
+        let mut rfl = path_len;
+        if path_len < 0
+        {
+            rfl = path_len * -2; // needed if utf16
+        }
+        let mut path = vec![0u8; rfl as usize];
+        reader.read_exact(&mut path)?;
 
-    let pf = reader.read_i32::<LittleEndian>()?;
+        let pak_flags = reader.read_i32::<LittleEndian>()?;
 
-    let nc = reader.read_i32::<LittleEndian>()?;
-    let no = reader.read_i32::<LittleEndian>()?;
-    let ec = reader.read_i32::<LittleEndian>()?;
-    let eo = reader.read_i32::<LittleEndian>()?;
-    let ic = reader.read_i32::<LittleEndian>()?;
-    let io = reader.read_i32::<LittleEndian>()?;
-    let depo = reader.read_i32::<LittleEndian>()?;
+        let name_count = reader.read_i32::<LittleEndian>()?;
+        let name_offset = reader.read_i32::<LittleEndian>()?;
+        let export_count = reader.read_i32::<LittleEndian>()?;
+        let export_offset = reader.read_i32::<LittleEndian>()?;
+        let import_count = reader.read_i32::<LittleEndian>()?;
+        let import_offset = reader.read_i32::<LittleEndian>()?;
+        let depends_offset = reader.read_i32::<LittleEndian>()?;
 
-    if ic <= 0 || nc <= 0 || ec <= 0
-    {
-        return Err(Error::new(ErrorKind::InvalidData, "Corrupted pak"));
-    }
+        if import_count <= 0 || name_count <= 0 || export_count <= 0
+        {
+            return Err(Error::new(ErrorKind::InvalidData, "Corrupted pak"));
+        }
 
-    let mut unks = [0; 4];
-    let mut is_unks = false;
+        let mut unk = [0; 4];
+        let mut is_unks = false;
 
-    if p_ver >= 801 { // found in Dishonored, Batman: Arkham City
-        is_unks = true;
-        unks =
+        if p_ver >= 801 { // found in Dishonored, Batman: Arkham City
+            is_unks = true;
+            unk =
+                [
+                reader.read_i32::<LittleEndian>()?,
+                reader.read_i32::<LittleEndian>()?,
+                reader.read_i32::<LittleEndian>()?,
+                reader.read_i32::<LittleEndian>()?,
+                ];
+        }
+
+        let guid =
             [
             reader.read_i32::<LittleEndian>()?,
             reader.read_i32::<LittleEndian>()?,
             reader.read_i32::<LittleEndian>()?,
             reader.read_i32::<LittleEndian>()?,
             ];
+
+        let gen_count = reader.read_i32::<LittleEndian>()?;
+        let mut gens = Vec::with_capacity(gen_count as usize);
+
+        for _ in 0..gen_count
+        {
+            gens.push(
+                GenerationInfo
+                {
+                    export_count: reader.read_i32::<LittleEndian>()?,
+                    name_count: reader.read_i32::<LittleEndian>()?,
+                    net_obj_count: reader.read_i32::<LittleEndian>()?
+                }
+            );
+        }
+
+        let engine_ver = reader.read_i32::<LittleEndian>()?;
+        let cooker_ver = reader.read_i32::<LittleEndian>()?;
+        let compression = 
+            CompressionMethod::try_from(reader.read_u32::<LittleEndian>()?).unwrap();
+        let compressed_chunks = reader.read_u32::<LittleEndian>()?;
+
+        let header = UpkHeader
+        {
+            sign,
+            p_ver,
+            l_ver,
+            header_size,
+            path_len,
+            path,
+            pak_flags,
+            name_count,
+            name_offset,
+            export_count,
+            export_offset,
+            import_count,
+            import_offset,
+            depends_offset,
+            is_unks,
+            unk,
+            guid,
+            gen_count,
+            gens,
+            engine_ver,
+            cooker_ver,
+            compression,
+            compressed_chunks
+        };
+
+        Ok(header)
     }
 
-    let gid =
-        [
-        reader.read_i32::<LittleEndian>()?,
-        reader.read_i32::<LittleEndian>()?,
-        reader.read_i32::<LittleEndian>()?,
-        reader.read_i32::<LittleEndian>()?,
-        ];
-
-    let gc = reader.read_i32::<LittleEndian>()?;
-    let mut gens = Vec::with_capacity(gc as usize);
-
-    for _ in 0..gc
+    pub fn write<R: Write + Seek>(&self, mut writer: R) -> Result<()>
     {
-        gens.push(
-            GenerationInfo
-            {
-                export_count: reader.read_i32::<LittleEndian>()?,
-                name_count: reader.read_i32::<LittleEndian>()?,
-                net_obj_count: reader.read_i32::<LittleEndian>()?
+        writer.write_u32::<LittleEndian>(self.sign)?;
+        writer.write_i16::<LittleEndian>(self.p_ver)?;
+        writer.write_i16::<LittleEndian>(self.l_ver)?;
+        writer.write_i32::<LittleEndian>(self.header_size)?;
+        writer.write_i32::<LittleEndian>(self.path_len)?;
+        writer.write_all(&self.path)?;
+        writer.write_i32::<LittleEndian>(self.pak_flags)?;
+        writer.write_i32::<LittleEndian>(self.name_count)?;
+        writer.write_i32::<LittleEndian>(self.name_offset)?;
+        writer.write_i32::<LittleEndian>(self.export_count)?;
+        writer.write_i32::<LittleEndian>(self.export_offset)?;
+        writer.write_i32::<LittleEndian>(self.import_count)?;
+        writer.write_i32::<LittleEndian>(self.import_offset)?;
+        writer.write_i32::<LittleEndian>(self.depends_offset)?;
+
+        if self.is_unks {
+            for v in &self.unk {
+                writer.write_i32::<LittleEndian>(*v)?;
             }
-        );
+        }
+
+        for v in &self.guid {
+            writer.write_i32::<LittleEndian>(*v)?;
+        }
+
+        writer.write_i32::<LittleEndian>(self.gens.len() as i32)?;
+
+        for g in &self.gens {
+            writer.write_i32::<LittleEndian>(g.export_count)?;
+            writer.write_i32::<LittleEndian>(g.name_count)?;
+            writer.write_i32::<LittleEndian>(g.net_obj_count)?;
+        }
+
+        writer.write_i32::<LittleEndian>(self.engine_ver)?;
+        writer.write_i32::<LittleEndian>(self.cooker_ver)?;
+        writer.write_u32::<LittleEndian>(self.compression as u32)?;
+        writer.write_u32::<LittleEndian>(self.compressed_chunks)?;
+
+        Ok(())
     }
-
-    let ev = reader.read_i32::<LittleEndian>()?;
-    let cv = reader.read_i32::<LittleEndian>()?;
-    let cf = reader.read_u32::<LittleEndian>()?;
-    let compressed_chunks = reader.read_u32::<LittleEndian>()?;
-
-    let header = UpkHeader
-    {
-        sign,
-        p_ver,
-        l_ver,
-        header_size,
-        path_len: fl,
-        path: pn,
-        pak_flags: pf,
-        name_count: nc,
-        name_offset: no,
-        export_count: ec,
-        export_offset: eo,
-        import_count: ic,
-        import_offset: io,
-        depends_offset: depo,
-        is_unks,
-        unk: unks,
-        guid: gid,
-        gen_count: gc,
-        gens,
-        engine_ver: ev,
-        cooker_ver: cv,
-        compression: CompressionMethod::try_from(cf).unwrap(),
-        compressed_chunks
-    };
-
-    Ok(header)
 }
 

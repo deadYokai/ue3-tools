@@ -13,20 +13,27 @@ mod upkfont;
 
 fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
 {
-
     let path = Path::new(path);
-
     let file = File::open(path)?;
-
     let mut reader = BufReader::new(file);
 
-    let header = upkreader::upk_read_header(&mut reader)?;
+    let filesize = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    let header = UpkHeader::read(&mut reader)?;
     println!("{}", header);
+
+    let mut end_header_offest = reader.stream_position()? as usize;
      
     if header.compression != CompressionMethod::None 
     {
 
         if header.compressed_chunks != 0 {
+
+            let mut cloned_header = header.clone();
+            cloned_header.compression = CompressionMethod::None;
+            cloned_header.compressed_chunks = 0;
+
             let mut chunks = Vec::with_capacity(header.compressed_chunks as usize);
 
             for _ in 0..header.compressed_chunks {
@@ -40,14 +47,55 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
             
             chunks.sort_by_key(|c| c.decompressed_offset);
 
+            let first_chunk_offset = chunks[0].compressed_offset as usize;
+
             println!("Compressed chunks: {:?}", chunks);
 
             let dec_data = upk_decompress(&mut reader, header.compression, &chunks)
                 .expect("Decompression error"); 
- 
+
             let file = File::create("test.upk")?;
             let mut writer = BufWriter::new(file);
-            writer.write_all(&dec_data)?;
+
+            cloned_header.write(&mut writer)?;
+
+            let pre_data_len = first_chunk_offset - end_header_offest - (chunks.len() * 16);
+
+            if pre_data_len > 0 {
+                reader.seek(SeekFrom::Start((end_header_offest + (chunks.len() * 16)) as u64))?;
+                let mut pre_data = vec![0u8; pre_data_len];
+                reader.read_exact(&mut pre_data)?;
+                writer.write_all(&pre_data)?;
+            }
+            
+            for (i, c) in dec_data.iter().enumerate() {
+                if i != 0 {
+                    let prev = chunks[i-1].compressed_offset +
+                        chunks[i-1].compressed_size;
+
+                    let diff = chunks[i].compressed_offset - prev;
+
+                    if diff > 0 {
+                        reader.seek(SeekFrom::Start(prev as u64))?;
+                        let mut data = vec![0u8; diff as usize];
+                        reader.read_exact(&mut data)?;
+                        writer.write_all(&data)?;
+                    }
+                }
+                writer.seek(SeekFrom::Start(chunks[i].decompressed_offset as u64))?;
+                writer.write_all(c)?;
+            }
+
+            let last = chunks[chunks.len() - 1].compressed_offset +
+                chunks[chunks.len() - 1].compressed_size;
+
+            if filesize > last as u64 {
+                 reader.seek(SeekFrom::Start(last as u64))?;
+                 let mut data = vec![0u8; (filesize - last as u64) as usize];
+                 reader.read_exact(&mut data)?;
+                 writer.write_all(&data)?;
+            }
+ 
         }
 
         exit(-1);
