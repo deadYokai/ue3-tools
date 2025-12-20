@@ -2,8 +2,63 @@ use std::{fmt, fs::File, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result,
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{to_string_pretty, PrettyConfig};
 use serde::{Serialize, Deserialize};
-
+use bitflags::bitflags;
 use crate::{upkdecompress::CompressionMethod, upkprops::{self, Property, PropertyValue}};
+
+pub const PACKAGE_TAG: u32 = 0x9E2A83C1;
+
+bitflags! {
+    pub struct PackageFlags: u32 {
+        const AllowDownload = 0x1;
+        const ClientOptional = 0x2;
+        const ServerSideOnly = 0x4;
+        const Cooked = 0x8;
+        const Unsecure = 0x10;
+        const SavedWithNewerVersion = 0x20;
+        const Need = 0x8000;
+        const ContainsMap = 0x20000;
+        const Trash = 0x40000;
+        const DisallowLazyLoading = 0x100000;
+        const ContainsScript = 0x200000;
+        const ContainsDebugInfo = 0x400000;
+        const RequireImportsAlreadyLoaded = 0x800000;
+        const StoreCompressed = 0x2000000;
+        const StoreFullyCompressed = 0x4000000;
+        const ContainsFaceFxData = 0x10000000;
+        const NoExportAllowed = 0x20000000;
+        const StrippedSource = 0x40000000;
+        const FilterEditorOnly = 0x80000000;
+    }
+}
+
+impl PackageFlags {
+    pub fn print_flags(&self) {
+        for (flag, name) in [
+            (PackageFlags::AllowDownload, "AllowDownload"),
+            (PackageFlags::ClientOptional, "ClientOptional"),
+            (PackageFlags::ServerSideOnly, "ServerSideOnly"),
+            (PackageFlags::Cooked, "Cooked"),
+            (PackageFlags::Unsecure, "Unsecure"),
+            (PackageFlags::SavedWithNewerVersion, "SavedWithNewerVersion"),
+            (PackageFlags::Need, "Need"),
+            (PackageFlags::ContainsMap, "ContainsMap"),
+            (PackageFlags::Trash, "Trash"),
+            (PackageFlags::DisallowLazyLoading, "DisallowLazyLoading"),
+            (PackageFlags::ContainsScript, "ContainsScript"),
+            (PackageFlags::ContainsDebugInfo, "ContainsDebugInfo"),
+            (PackageFlags::RequireImportsAlreadyLoaded, "RequireImportsAlreadyLoaded"),
+            (PackageFlags::StoreCompressed, "StoreCompressed"),
+            (PackageFlags::StoreFullyCompressed, "StoreFullyCompressed"),
+            (PackageFlags::NoExportAllowed, "NoExportAllowed"),
+            (PackageFlags::StrippedSource, "StrippedSource"),
+            (PackageFlags::FilterEditorOnly, "FilterEditorOnly"),
+        ] {
+            if self.contains(flag){
+                println!(" - {}", name);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Names
@@ -69,7 +124,7 @@ pub struct UpkHeader
     pub header_size: i32,
     pub path_len: i32,
     pub path: Vec<u8>,
-    pub pak_flags: i32,
+    pub pak_flags: u32,
     pub name_count: i32,
     pub name_offset: i32,
     pub export_count: i32,
@@ -505,7 +560,8 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Licensee Version: {}", self.l_ver)?;
         writeln!(f, "Header Size: {}", self.header_size)?;
         writeln!(f, "Folder: {:?}", String::from_utf8_lossy(&self.path))?;
-        writeln!(f, "Package Flags: {}", self.pak_flags)?;
+        writeln!(f, "Package Flags: (0x{:08x})", self.pak_flags)?;
+        PackageFlags::from_bits_truncate(self.pak_flags).print_flags();
         writeln!(f, "Name Count: {}", self.name_count)?;
         writeln!(f, "Export Count: {}", self.export_count)?;
         writeln!(f, "Import Count: {}", self.import_count)?;
@@ -537,7 +593,7 @@ impl UpkHeader {
     pub fn read<R: Read + Seek>(mut reader: R) -> Result<Self>
     {
         let sign = reader.read_u32::<LittleEndian>()?;
-        if sign != 0x9E2A83C1
+        if sign != PACKAGE_TAG
         {
             return Err(Error::new(ErrorKind::InvalidData, format!("Invalid file signature, sig=0x{:X}", sign)));
         }
@@ -555,7 +611,7 @@ impl UpkHeader {
         let mut path = vec![0u8; rfl as usize];
         reader.read_exact(&mut path)?;
 
-        let pak_flags = reader.read_i32::<LittleEndian>()?;
+        let pak_flags = reader.read_u32::<LittleEndian>()?;
 
         let name_count = reader.read_i32::<LittleEndian>()?;
         let name_offset = reader.read_i32::<LittleEndian>()?;
@@ -651,7 +707,7 @@ impl UpkHeader {
         writer.write_i32::<LittleEndian>(self.header_size)?;
         writer.write_i32::<LittleEndian>(self.path_len)?;
         writer.write_all(&self.path)?;
-        writer.write_i32::<LittleEndian>(self.pak_flags)?;
+        writer.write_u32::<LittleEndian>(self.pak_flags)?;
         writer.write_i32::<LittleEndian>(self.name_count)?;
         writer.write_i32::<LittleEndian>(self.name_offset)?;
         writer.write_i32::<LittleEndian>(self.export_count)?;

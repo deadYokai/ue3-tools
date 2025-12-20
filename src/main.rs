@@ -2,7 +2,7 @@ use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, See
 use byteorder::{LittleEndian, ReadBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
 use upkreader::parse_upk;
-use crate::{upkdecompress::{upk_decompress, CompressedChunk, CompressionMethod}, upkreader::{get_obj_props, UPKPak, UpkHeader}};
+use crate::{upkdecompress::{upk_decompress, CompressedChunk, CompressionMethod}, upkreader::{get_obj_props, PackageFlags, UPKPak, UpkHeader}};
 use clap::{Parser, Subcommand};
 
 mod upkreader;
@@ -23,16 +23,19 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
     let header = UpkHeader::read(&mut reader)?;
     println!("{}", header);
 
-    let mut end_header_offest = reader.stream_position()? as usize;
+    let end_header_offest = reader.stream_position()? as usize;
      
     if header.compression != CompressionMethod::None 
     {
 
         if header.compressed_chunks != 0 {
 
+            println!("File is compressed, trying decompress...");
+
             let mut cloned_header = header.clone();
             cloned_header.compression = CompressionMethod::None;
             cloned_header.compressed_chunks = 0;
+            cloned_header.pak_flags = header.pak_flags & !PackageFlags::StoreCompressed.bits();
 
             let mut chunks = Vec::with_capacity(header.compressed_chunks as usize);
 
@@ -49,12 +52,10 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
             let first_chunk_offset = chunks[0].compressed_offset as usize;
 
-            println!("Compressed chunks: {:?}", chunks);
-
             let dec_data = upk_decompress(&mut reader, header.compression, &chunks)
                 .expect("Decompression error"); 
 
-            let file = File::create("test.upk")?;
+            let file = File::create(".tmp.upk")?;
             let mut writer = BufWriter::new(file);
 
             cloned_header.write(&mut writer)?;
@@ -98,7 +99,11 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
  
         }
 
-        exit(-1);
+        println!("File is decompressed. Reopening file");
+
+        fs::remove_file(path)?;
+        fs::rename(".tmp.upk", path)?;
+        return upk_header_cursor(path.to_str().unwrap());
     }
 
     reader.seek(SeekFrom::Start(0))?;
