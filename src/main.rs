@@ -51,9 +51,10 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
             cloned_header.write(&mut writer)?;
 
-            let pre_data_len = first_chunk_offset - end_header_offest - (chunks.len() * 16);
 
-            if pre_data_len > 0 {
+
+            if first_chunk_offset < end_header_offest {
+                let pre_data_len = first_chunk_offset - end_header_offest - (chunks.len() * 16);
                 reader.seek(SeekFrom::Start((end_header_offest + (chunks.len() * 16)) as u64))?;
                 let mut pre_data = vec![0u8; pre_data_len];
                 reader.read_exact(&mut pre_data)?;
