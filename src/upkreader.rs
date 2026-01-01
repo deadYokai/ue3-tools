@@ -1,4 +1,4 @@
-use std::{fmt, fs::File, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::{Path, PathBuf}};
+use std::{collections::HashMap, fmt, fs::File, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::{Path, PathBuf}};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{to_string_pretty, PrettyConfig};
 use serde::{Serialize, Deserialize};
@@ -71,29 +71,53 @@ pub struct Names
     n_fl: i32
 }
 
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub struct FName {
+    name_index: i32,
+    name_instance: i32
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Export
 {
-    obj_type_ref: i32,
-    parent_class_ref: i32,
-    owner_ref: i32,
-    name_tbl_idx: i32,
-    name_count: i32, // if non-zero "_N" added to objName,
-                     // where N = NameCount-1
-    field6: i32,
-    obj_flags_h: i32,
-    obj_flags_l: i32,
-    obj_filesize: i32,
-    data_offset: i32,
-    field11: i32,
-    num_additional_fields: i32,
-    field13: i32,
-    field14: i32,
-    field15: i32,
-    field16: i32,
-    field17: i32,
-    unk_fields: Vec<i32>
+    class_index: i32,
+    super_index: i32,
+    outer_index: i32,
+    object_name: FName,
+    archetype: i32,
+    object_flags: u64,
+    serial_size: i32,
+    serial_offset: i32,
+    legacy_component_map: HashMap<FName, i32>,
+    export_flags: u32,
+    generation_net_object_count: Vec<i32>,
+    package_guid: [i32; 4],
+    package_flags: u32
 }
+
+//
+// old struct Export
+//
+// obj_type_ref: i32,
+// parent_class_ref: i32,
+// owner_ref: i32,
+// name_tbl_idx: i32,
+// name_count: i32, // if non-zero "_N" added to objName,
+//                  // where N = NameCount-1
+// field6: i32,
+// obj_flags_h: i32,
+// obj_flags_l: i32,
+// obj_filesize: i32,
+// data_offset: i32,
+// field11: i32,
+// num_additional_fields: i32,
+// field13: i32,
+// field14: i32,
+// field15: i32,
+// field16: i32,
+// field17: i32,
+// unk_fields: Vec<i32>
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Import
@@ -178,49 +202,90 @@ pub fn parse_upk(cursor: &mut Cursor<&Vec<u8>>, header: &UpkHeader) -> Result<UP
     cursor.set_position(export_offset as u64);
     for _ in 0..export_count
     {
-        let obj_type_ref = cursor.read_i32::<LittleEndian>()?;
-        let parent_class_ref = cursor.read_i32::<LittleEndian>()?;
-        let owner_ref = cursor.read_i32::<LittleEndian>()?;
-        let name_tbl_idx = cursor.read_i32::<LittleEndian>()?;
-        let name_count = cursor.read_i32::<LittleEndian>()?;
-        let field6 = cursor.read_i32::<LittleEndian>()?;
-        let obj_flags_h = cursor.read_i32::<LittleEndian>()?;
-        let obj_flags_l = cursor.read_i32::<LittleEndian>()?;
-        let obj_filesize = cursor.read_i32::<LittleEndian>()?;
-        let data_offset = cursor.read_i32::<LittleEndian>()?;
-        let field11 = cursor.read_i32::<LittleEndian>()?;
-        let num_additional_fields = cursor.read_i32::<LittleEndian>()?;
+        // let obj_type_ref = cursor.read_i32::<LittleEndian>()?;
+        // let parent_class_ref = cursor.read_i32::<LittleEndian>()?;
+        // let owner_ref = cursor.read_i32::<LittleEndian>()?;
+        // let name_tbl_idx = cursor.read_i32::<LittleEndian>()?;
+        // let name_count = cursor.read_i32::<LittleEndian>()?;
+        // let field6 = cursor.read_i32::<LittleEndian>()?;
+        // let obj_flags_h = cursor.read_i32::<LittleEndian>()?;
+        // let obj_flags_l = cursor.read_i32::<LittleEndian>()?;
+        // let obj_filesize = cursor.read_i32::<LittleEndian>()?;
+        // let data_offset = cursor.read_i32::<LittleEndian>()?;
+        // let field11 = cursor.read_i32::<LittleEndian>()?;
+        // let num_additional_fields = cursor.read_i32::<LittleEndian>()?;
+        //
+        // let mut unk_fields = Vec::new();
+        // for _ in 0..num_additional_fields {
+        //     unk_fields.push(cursor.read_i32::<LittleEndian>()?);
+        // }
+        //
+        // let field13 = cursor.read_i32::<LittleEndian>()?;
+        // let field14 = cursor.read_i32::<LittleEndian>()?;
+        // let field15 = cursor.read_i32::<LittleEndian>()?;
+        // let field16 = cursor.read_i32::<LittleEndian>()?;
+        // let field17 = cursor.read_i32::<LittleEndian>()?;
 
-        let mut unk_fields = Vec::new();
-        for _ in 0..num_additional_fields {
-            unk_fields.push(cursor.read_i32::<LittleEndian>()?);
+        let class_index = cursor.read_i32::<LittleEndian>()?;
+        let super_index = cursor.read_i32::<LittleEndian>()?;
+        let outer_index = cursor.read_i32::<LittleEndian>()?;
+
+        let object_name = FName { 
+            name_index: cursor.read_i32::<LittleEndian>()?, 
+            name_instance: cursor.read_i32::<LittleEndian>()?
+        };
+
+
+        let archetype = cursor.read_i32::<LittleEndian>()?;
+
+        let object_flags = cursor.read_u64::<LittleEndian>()?;
+
+        let serial_size = cursor.read_i32::<LittleEndian>()?;
+        let serial_offset = cursor.read_i32::<LittleEndian>()?;
+        
+        let mut legacy_component_map: HashMap<FName, i32> = HashMap::new();
+        if header.p_ver < 543 {
+            let count = cursor.read_i32::<LittleEndian>()?;
+            for _ in 0..count {
+                let k = FName { 
+                    name_index: cursor.read_i32::<LittleEndian>()?, 
+                    name_instance: cursor.read_i32::<LittleEndian>()?
+                };
+                let v = cursor.read_i32::<LittleEndian>()?;
+                legacy_component_map.insert(k, v);
+            }
         }
 
-        let field13 = cursor.read_i32::<LittleEndian>()?;
-        let field14 = cursor.read_i32::<LittleEndian>()?;
-        let field15 = cursor.read_i32::<LittleEndian>()?;
-        let field16 = cursor.read_i32::<LittleEndian>()?;
-        let field17 = cursor.read_i32::<LittleEndian>()?;
+        let export_flags = cursor.read_u32::<LittleEndian>()?;
+    
+        let gen_count = cursor.read_i32::<LittleEndian>()?;
+        let mut generation_net_object_count = Vec::with_capacity(gen_count as usize);
+        for _ in 0..gen_count {
+            generation_net_object_count.push(cursor.read_i32::<LittleEndian>()?);
+        }
+
+        let package_guid = [
+            cursor.read_i32::<LittleEndian>()?,
+            cursor.read_i32::<LittleEndian>()?,
+            cursor.read_i32::<LittleEndian>()?,
+            cursor.read_i32::<LittleEndian>()?
+        ];
+        let package_flags = cursor.read_u32::<LittleEndian>()?;
 
         export_table.push(Export {
-            obj_type_ref,
-            parent_class_ref,
-            owner_ref,
-            name_tbl_idx,
-            name_count,
-            field6,
-            obj_flags_h,
-            obj_flags_l,
-            obj_filesize,
-            data_offset,
-            field11,
-            num_additional_fields,
-            field13,
-            field14,
-            field15,
-            field16,
-            field17,
-            unk_fields,
+            class_index,
+            super_index,
+            outer_index,
+            object_name,
+            archetype,
+            object_flags,
+            serial_size,
+            serial_offset,
+            legacy_component_map,
+            export_flags,
+            generation_net_object_count,
+            package_guid,
+            package_flags
         });
 
     }
@@ -265,8 +330,8 @@ pub fn resolve_type_name(obj_type_ref: i32, pkg: &UPKPak) -> String {
         let export_index = (obj_type_ref - 1) as usize;
         if export_index < pkg.export_table.len() {
             let export = &pkg.export_table[export_index];
-            if (export.name_tbl_idx as usize) < pkg.name_table.len() {
-                return pkg.name_table[export.name_tbl_idx as usize].clone();
+            if (export.object_name.name_index as usize) < pkg.name_table.len() {
+                return pkg.name_table[export.object_name.name_index as usize].clone();
             }
         }
     }
@@ -289,23 +354,23 @@ fn export_full_path(pkg: &UPKPak, idx: usize) -> String {
         let exp = &pkg.export_table[i as usize - 1];
 
         let mut name = pkg.name_table
-            .get(exp.name_tbl_idx as usize)
+            .get(exp.object_name.name_index as usize)
             .cloned().unwrap_or_else(|| "<invalid>".to_string());
 
 
-        if exp.name_count > 0
+        if exp.object_name.name_instance > 0
         {
-            name = format!("{}_{}", name, exp.name_count - 1);
+            name = format!("{}_{}", name, exp.object_name.name_instance - 1);
         }
 
         if first {
-            let extension = resolve_type_name(exp.obj_type_ref, pkg);
+            let extension = resolve_type_name(exp.class_index, pkg);
             name = format!("{}.{}", name, extension);
             first = false;
         }
         path_parts.push(name);
 
-        current = Some(exp.owner_ref);
+        current = Some(exp.outer_index);
     }
 
     path_parts.reverse();
@@ -416,8 +481,8 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
                 std::fs::create_dir_all(parent)?;
             }
 
-            cursor.seek(std::io::SeekFrom::Start(exp.data_offset as u64))?;
-            let mut buffer = vec![0u8; exp.obj_filesize as usize];
+            cursor.seek(std::io::SeekFrom::Start(exp.serial_offset as u64))?;
+            let mut buffer = vec![0u8; exp.serial_size as usize];
             cursor.read_exact(&mut buffer)?;
 
             let out_path = write_extracted_file(&file_path, &buffer, pkg)?; 
