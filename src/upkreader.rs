@@ -1,4 +1,5 @@
 use std::{collections::HashMap, fmt, fs::File, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::{Path, PathBuf}};
+
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{to_string_pretty, PrettyConfig};
 use serde::{Serialize, Deserialize};
@@ -61,14 +62,10 @@ impl PackageFlags {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Names
+pub struct NameEntry
 {
-    pub n_len: i32,
-    pub is_utf16: bool,
-    pub name_bytes: Vec<u8>,
-    pub name: String,
-    n_fh: i32,
-    n_fl: i32
+   pub name: String,
+   pub flags: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -95,40 +92,99 @@ pub struct Export
     package_flags: u32
 }
 
-//
-// old struct Export
-//
-// obj_type_ref: i32,
-// parent_class_ref: i32,
-// owner_ref: i32,
-// name_tbl_idx: i32,
-// name_count: i32, // if non-zero "_N" added to objName,
-//                  // where N = NameCount-1
-// field6: i32,
-// obj_flags_h: i32,
-// obj_flags_l: i32,
-// obj_filesize: i32,
-// data_offset: i32,
-// field11: i32,
-// num_additional_fields: i32,
-// field13: i32,
-// field14: i32,
-// field15: i32,
-// field16: i32,
-// field17: i32,
-// unk_fields: Vec<i32>
+impl Export {
+    pub fn read(cursor: &mut Cursor<&Vec<u8>>, ver: i16) -> Result<Self>{
+        let class_index = cursor.read_i32::<LittleEndian>()?;
+        let super_index = cursor.read_i32::<LittleEndian>()?;
+        let outer_index = cursor.read_i32::<LittleEndian>()?;
 
+        let object_name = FName { 
+            name_index: cursor.read_i32::<LittleEndian>()?, 
+            name_instance: cursor.read_i32::<LittleEndian>()?
+        };
+
+
+        let archetype = cursor.read_i32::<LittleEndian>()?;
+
+        let object_flags = cursor.read_u64::<LittleEndian>()?;
+
+        let serial_size = cursor.read_i32::<LittleEndian>()?;
+        let serial_offset = cursor.read_i32::<LittleEndian>()?;
+        
+        let mut legacy_component_map: HashMap<FName, i32> = HashMap::new();
+        if ver < 543 {
+            let count = cursor.read_i32::<LittleEndian>()?;
+            for _ in 0..count {
+                let k = FName { 
+                    name_index: cursor.read_i32::<LittleEndian>()?, 
+                    name_instance: cursor.read_i32::<LittleEndian>()?
+                };
+                let v = cursor.read_i32::<LittleEndian>()?;
+                legacy_component_map.insert(k, v);
+            }
+        }
+
+        let export_flags = cursor.read_u32::<LittleEndian>()?;
+    
+        let gen_count = cursor.read_i32::<LittleEndian>()?;
+        let mut generation_net_object_count = Vec::with_capacity(gen_count as usize);
+        for _ in 0..gen_count {
+            generation_net_object_count.push(cursor.read_i32::<LittleEndian>()?);
+        }
+
+        let package_guid = [
+            cursor.read_i32::<LittleEndian>()?,
+            cursor.read_i32::<LittleEndian>()?,
+            cursor.read_i32::<LittleEndian>()?,
+            cursor.read_i32::<LittleEndian>()?
+        ];
+        let package_flags = cursor.read_u32::<LittleEndian>()?;
+
+        Ok(Self {
+            class_index,
+            super_index,
+            outer_index,
+            object_name,
+            archetype,
+            object_flags,
+            serial_size,
+            serial_offset,
+            legacy_component_map,
+            export_flags,
+            generation_net_object_count,
+            package_guid,
+            package_flags
+        })
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Import
 {
-    package_idx: i32,
-    unk1: i32,
-    obj_type_idx: i32,
-    unk2: i32,
-    owner_ref: i32,
-    name_tbl_idx: i32,
-    unk3: i32
+    pub class_package: FName,
+    pub class_name: FName,
+    pub outer_index: i32,
+    pub object_name: FName
+}
+
+impl Import {
+    pub fn read(cursor: &mut Cursor<&Vec<u8>>) -> Result<Self> {
+        Ok(Self {
+            class_package: FName {
+                name_index: cursor.read_i32::<LittleEndian>()?,
+                name_instance: cursor.read_i32::<LittleEndian>()?,
+            },
+            class_name: FName {
+                name_index: cursor.read_i32::<LittleEndian>()?,
+                name_instance: cursor.read_i32::<LittleEndian>()?,
+            },
+            outer_index: cursor.read_i32::<LittleEndian>()?,
+            object_name: FName {
+                name_index: cursor.read_i32::<LittleEndian>()?,
+                name_instance: cursor.read_i32::<LittleEndian>()?,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -181,214 +237,252 @@ pub struct UPKPak
     pub import_table: Vec<Import>,
 }
 
-pub fn parse_upk(cursor: &mut Cursor<&Vec<u8>>, header: &UpkHeader) -> Result<UPKPak>
-{
-    let name_count = header.name_count;
-    let name_offset = header.name_offset;
-    let export_count = header.export_count;
-    let export_offset = header.export_offset;
-    let import_count = header.import_count;
-    let import_offset = header.import_offset;
-
-    let mut name_table = Vec::new();
-    cursor.set_position(name_offset as u64);
-    for _ in 0..name_count
+impl UPKPak { 
+    pub fn parse_upk(cursor: &mut Cursor<&Vec<u8>>, header: &UpkHeader) -> Result<Self>
     {
-        let name = read_name(cursor)?;
-        name_table.push(name.name);
+        let name_count = header.name_count;
+        let name_offset = header.name_offset;
+        let export_count = header.export_count;
+        let export_offset = header.export_offset;
+        let import_count = header.import_count;
+        let import_offset = header.import_offset;
+
+        let mut name_table = Vec::new();
+        cursor.set_position(name_offset as u64);
+        for _ in 0..name_count
+        {
+            let name = read_name(cursor)?;
+            name_table.push(name.name);
+        }
+
+        let mut export_table = Vec::new();
+        cursor.set_position(export_offset as u64);
+        for _ in 0..export_count
+        {
+            export_table.push(Export::read(cursor, header.p_ver)?);
+        }
+
+        let mut import_table = Vec::new();
+
+        cursor.set_position(import_offset as u64);
+        for _ in 0..import_count
+        {
+            import_table.push(Import::read(cursor)?);
+        }
+
+        Ok(Self{name_table, export_table, import_table})
     }
 
-    let mut export_table = Vec::new();
-    cursor.set_position(export_offset as u64);
-    for _ in 0..export_count
-    {
-        // let obj_type_ref = cursor.read_i32::<LittleEndian>()?;
-        // let parent_class_ref = cursor.read_i32::<LittleEndian>()?;
-        // let owner_ref = cursor.read_i32::<LittleEndian>()?;
-        // let name_tbl_idx = cursor.read_i32::<LittleEndian>()?;
-        // let name_count = cursor.read_i32::<LittleEndian>()?;
-        // let field6 = cursor.read_i32::<LittleEndian>()?;
-        // let obj_flags_h = cursor.read_i32::<LittleEndian>()?;
-        // let obj_flags_l = cursor.read_i32::<LittleEndian>()?;
-        // let obj_filesize = cursor.read_i32::<LittleEndian>()?;
-        // let data_offset = cursor.read_i32::<LittleEndian>()?;
-        // let field11 = cursor.read_i32::<LittleEndian>()?;
-        // let num_additional_fields = cursor.read_i32::<LittleEndian>()?;
-        //
-        // let mut unk_fields = Vec::new();
-        // for _ in 0..num_additional_fields {
-        //     unk_fields.push(cursor.read_i32::<LittleEndian>()?);
-        // }
-        //
-        // let field13 = cursor.read_i32::<LittleEndian>()?;
-        // let field14 = cursor.read_i32::<LittleEndian>()?;
-        // let field15 = cursor.read_i32::<LittleEndian>()?;
-        // let field16 = cursor.read_i32::<LittleEndian>()?;
-        // let field17 = cursor.read_i32::<LittleEndian>()?;
+    pub fn fname_to_string(&self, fname: &FName) -> String {
+        if let Some(name) = self.name_table.get(fname.name_index as usize) {
+            if fname.name_instance > 0 {
+                format!("{}_{}", name, fname.name_instance - 1)
+            } else {
+                name.clone()
+            }
+        } else {
+            "<invalid>".to_string()
+        }
+    }
 
-        let class_index = cursor.read_i32::<LittleEndian>()?;
-        let super_index = cursor.read_i32::<LittleEndian>()?;
-        let outer_index = cursor.read_i32::<LittleEndian>()?;
+    pub fn get_import_class_name(&self, import_index: i32) -> String {
+        let idx = (-import_index - 1) as usize;
+        if let Some(import) = self.import_table.get(idx) {
+            self.fname_to_string(&import.class_name)
+        } else {
+            "Class".to_string()
+        }
+    }
 
-        let object_name = FName { 
-            name_index: cursor.read_i32::<LittleEndian>()?, 
-            name_instance: cursor.read_i32::<LittleEndian>()?
-        };
+    pub fn get_export_class_name(&self, export_index: i32) -> String {
+        let idx = (export_index - 1) as usize;
+        if let Some(export) = self.export_table.get(idx) {
+            self.fname_to_string(&export.object_name)
+        } else {
+            "Class".to_string()
+        }
+    }
 
+    pub fn get_class_name(&self, class_index: i32) -> String {
+        if class_index > 0 {
+            let idx = (class_index - 1) as usize;
+            if let Some(export) = self.export_table.get(idx) {
+                self.fname_to_string(&export.object_name)
+            } else {
+                "Class".to_string()
+            }
+        } else if class_index < 0 {
+            let idx = (-class_index - 1) as usize;
+            if let Some(import) = self.import_table.get(idx) {
+                self.fname_to_string(&import.object_name)
+            } else {
+                "Class".to_string()
+            }
+        } else {
+            "Class".to_string()
+        }
+    }
 
-        let archetype = cursor.read_i32::<LittleEndian>()?;
+    pub fn get_import_path_name(&self, import_index: i32) -> String {
+        let mut result = String::new();
+        let mut linker_index = -import_index - 1;
 
-        let object_flags = cursor.read_u64::<LittleEndian>()?;
-
-        let serial_size = cursor.read_i32::<LittleEndian>()?;
-        let serial_offset = cursor.read_i32::<LittleEndian>()?;
-        
-        let mut legacy_component_map: HashMap<FName, i32> = HashMap::new();
-        if header.p_ver < 543 {
-            let count = cursor.read_i32::<LittleEndian>()?;
-            for _ in 0..count {
-                let k = FName { 
-                    name_index: cursor.read_i32::<LittleEndian>()?, 
-                    name_instance: cursor.read_i32::<LittleEndian>()?
+        while linker_index != 0 {
+            let (object_name, outer_index, is_subobject) = 
+                if linker_index >= 0 {
+                    let idx = linker_index as usize;
+                    if let Some(import) = self.import_table.get(idx) {
+                        let is_subobj = !result.is_empty() 
+                            && self.fname_to_string(&import.class_name) != "Package"
+                            && self.is_package_outer(import.outer_index);
+                        
+                        (self.fname_to_string(&import.object_name), 
+                         import.outer_index, 
+                         is_subobj)
+                    } else {
+                        break;
+                    }
+                } else {
+                    let idx = (-linker_index - 1) as usize;
+                    if let Some(export) = self.export_table.get(idx) {
+                        let is_subobj = !result.is_empty()
+                            && self.get_class_name(-linker_index) != "Package"
+                            && self.is_package_outer(export.outer_index);
+                        
+                        (self.fname_to_string(&export.object_name),
+                         export.outer_index,
+                         is_subobj)
+                    } else {
+                        break;
+                    }
                 };
-                let v = cursor.read_i32::<LittleEndian>()?;
-                legacy_component_map.insert(k, v);
+
+            if !result.is_empty() {
+                result = if is_subobject {
+                    format!(":{}", result)
+                } else {
+                    format!(".{}", result)
+                };
+            }
+
+            result = format!("{}{}", object_name, result);
+            linker_index = outer_index;
+        }
+
+        result
+    }
+
+    pub fn get_export_path_name(&self, export_index: i32) -> String {
+        let mut result = String::new();
+        let mut linker_index = export_index;
+
+        while linker_index != 0 {
+            let idx = (linker_index - 1) as usize;
+            if let Some(export) = self.export_table.get(idx) {
+                if !result.is_empty() {
+                    let is_subobject = self.get_class_name(linker_index) != "Package"
+                        && self.is_package_outer(export.outer_index);
+                    
+                    result = if is_subobject {
+                        format!(":{}", result)
+                    } else {
+                        format!(".{}", result)
+                    };
+                }
+
+                result = format!("{}{}", 
+                    self.fname_to_string(&export.object_name), 
+                    result);
+                linker_index = export.outer_index;
+            } else {
+                break;
             }
         }
 
-        let export_flags = cursor.read_u32::<LittleEndian>()?;
+        result
+    }
+
+    pub fn get_import_full_name(&self, import_index: i32) -> String {
+        let idx = (-import_index - 1) as usize;
+        if let Some(import) = self.import_table.get(idx) {
+            let class_name = self.fname_to_string(&import.class_name);
+            let path_name = self.get_import_path_name(import_index);
+            format!("{} {}", class_name, path_name)
+        } else {
+            "<invalid>".to_string()
+        }
+    }
+
+    pub fn get_export_full_name(&self, export_index: i32) -> String {
+        let idx = (export_index - 1) as usize;
+        if let Some(export) = self.export_table.get(idx) {
+            let class_name = self.get_class_name(export.class_index);
+            let path_name = self.get_export_path_name(export_index);
+            format!("{} {}", class_name, path_name)
+        } else {
+            "<invalid>".to_string()
+        }
+    }
+
+    fn is_package_outer(&self, outer_index: i32) -> bool {
+        if outer_index == 0 {
+            return true;
+        }
+        
+        if outer_index > 0 {
+            self.get_export_class_name(outer_index) == "Package"
+        } else {
+            self.get_import_class_name(outer_index) == "Package"
+        }
+    }
     
-        let gen_count = cursor.read_i32::<LittleEndian>()?;
-        let mut generation_net_object_count = Vec::with_capacity(gen_count as usize);
-        for _ in 0..gen_count {
-            generation_net_object_count.push(cursor.read_i32::<LittleEndian>()?);
+    fn ue_name_to_path(full_name: &str) -> String {
+        let parts: Vec<&str> = full_name.splitn(2, ' ').collect();
+
+        if parts.len() != 2 {
+            return full_name.replace(&[':', '.'][..], "/");
         }
 
-        let package_guid = [
-            cursor.read_i32::<LittleEndian>()?,
-            cursor.read_i32::<LittleEndian>()?,
-            cursor.read_i32::<LittleEndian>()?,
-            cursor.read_i32::<LittleEndian>()?
-        ];
-        let package_flags = cursor.read_u32::<LittleEndian>()?;
+        let class_name = parts[0];
+        let path_name = parts[1];
+        let mut path_parts: Vec<String> = path_name
+            .split(&['.', ':'][..])
+            .map(|s| s.to_string())
+            .collect();
 
-        export_table.push(Export {
-            class_index,
-            super_index,
-            outer_index,
-            object_name,
-            archetype,
-            object_flags,
-            serial_size,
-            serial_offset,
-            legacy_component_map,
-            export_flags,
-            generation_net_object_count,
-            package_guid,
-            package_flags
-        });
+        if let Some(last) = path_parts.last_mut() {
+            *last = format!("{}.{}", last, class_name);
+        }
 
+        path_parts.join("/")
     }
 
-    // package_idx: i32,
-    // unk1: i32,
-    // obj_type_idx: i32,
-    // unk2: i32,
-    // owner_ref: i32,
-    // name_tbl_idx: i32,
-    // unk3: i32
+    fn ue_name_to_path_class_first(full_name: &str) -> String {
+        let parts: Vec<&str> = full_name.splitn(2, ' ').collect();
 
-    let mut import_table = Vec::new();
+        if parts.len() != 2 {
+            return full_name.replace(&[':', '.'][..], "/");
+        }
 
-    cursor.set_position(import_offset as u64);
-    for _ in 0..import_count
-    {
-        let package_idx = cursor.read_i32::<LittleEndian>()?;
-        let unk1 = cursor.read_i32::<LittleEndian>()?;
-        let obj_type_idx = cursor.read_i32::<LittleEndian>()?;
-        let unk2 = cursor.read_i32::<LittleEndian>()?;
-        let owner_ref = cursor.read_i32::<LittleEndian>()?;
-        let name_tbl_idx = cursor.read_i32::<LittleEndian>()?;
-        let unk3 = cursor.read_i32::<LittleEndian>()?;
+        let class_name = parts[0];
+        let path_name = parts[1];
 
-        import_table.push(Import { package_idx, unk1, obj_type_idx, unk2, owner_ref, name_tbl_idx, unk3 });
+        let path_parts: Vec<&str> = path_name.split(&['.', ':'][..]).collect();
+
+        std::iter::once(class_name)
+            .chain(path_parts.iter().copied())
+            .collect::<Vec<_>>()
+            .join("/")
     }
-
-    Ok(UPKPak{name_table, export_table, import_table})
 }
 
-pub fn resolve_type_name(obj_type_ref: i32, pkg: &UPKPak) -> String {
-    if obj_type_ref < 0 {
-        let import_index = (-obj_type_ref - 1) as usize;
-        if import_index < pkg.import_table.len() {
-            let import = &pkg.import_table[import_index];
-            if (import.name_tbl_idx as usize) < pkg.name_table.len() {
-                return pkg.name_table[import.name_tbl_idx as usize].clone();
-            }
-        }
-    } else if obj_type_ref > 0 {
-        let export_index = (obj_type_ref - 1) as usize;
-        if export_index < pkg.export_table.len() {
-            let export = &pkg.export_table[export_index];
-            if (export.object_name.name_index as usize) < pkg.name_table.len() {
-                return pkg.name_table[export.object_name.name_index as usize].clone();
-            }
-        }
-    }
-
-    "unk".to_string()
-}
-
-fn export_full_path(pkg: &UPKPak, idx: usize) -> String {
-    let mut path_parts = Vec::new();
-    let mut current = Some(idx as i32 + 1);
-    let mut first = true;
-
-    while let Some(i) = current
-    {
-        if i <= 0
-        {
-            break;
-        }
-
-        let exp = &pkg.export_table[i as usize - 1];
-
-        let mut name = pkg.name_table
-            .get(exp.object_name.name_index as usize)
-            .cloned().unwrap_or_else(|| "<invalid>".to_string());
-
-
-        if exp.object_name.name_instance > 0
-        {
-            name = format!("{}_{}", name, exp.object_name.name_instance - 1);
-        }
-
-        if first {
-            let extension = resolve_type_name(exp.class_index, pkg);
-            name = format!("{}.{}", name, extension);
-            first = false;
-        }
-        path_parts.push(name);
-
-        current = Some(exp.outer_index);
-    }
-
-    path_parts.reverse();
-    path_parts.join("/")
-
-}
-
-pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String>
-{
-    pkg.export_table
-        .iter()
-        .enumerate()
-        .map(|(idx, _)| export_full_path(pkg, idx))
+pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String> {
+    (0..pkg.export_table.len())
+        .map(|idx| pkg.get_export_full_name((idx + 1) as i32))
         .collect()
 }
 
-pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<PathBuf> {
-    
+pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<PathBuf> {    
     let ext = path.extension().and_then(|s| s.to_str()).unwrap();
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap();
     let dir = path.parent().unwrap();
@@ -414,7 +508,6 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<Pat
 
             let rawdata_find: &Property = props.iter().find(|s| s.name == "RawData").unwrap();
             let rawdata = rawdata_find.value.as_vec();
-            // let rawdata = &rawdata_find.value;
 
             let mut file_buffer = Vec::<u8>::new();
             
@@ -430,7 +523,6 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<Pat
                     
                 }
 
-                // rawdata.write_all(&mut writer)?;
                 writer.flush()?;
             }
 
@@ -439,8 +531,6 @@ pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<Pat
                 new_path = path.to_path_buf();
                 out_file.write_all(buf)?;
             } else {
-                // let filtered: Vec<_> = props.iter().filter(|s| s.name != "RawData")
-                //     .collect();
                 for prop in props.iter_mut() {
                     if prop.name == "RawData" {
                         prop.value = PropertyValue::String(format!("{}.gfx", name));
@@ -473,10 +563,14 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
     let mut found = false;
 
     for (idx, exp) in pkg.export_table.iter().enumerate() {
-        let full_path = export_full_path(pkg, idx);
-
-        if full_path.contains(path) || all {
-            let file_path = out_dir.join(&full_path);
+        let full_name = pkg.get_export_full_name((idx + 1) as i32);
+        
+        let fs_path = UPKPak::ue_name_to_path(&full_name);
+        
+        if fs_path.contains(path) || full_name.contains(path) || all {
+            let exp = &pkg.export_table[idx];
+            
+            let file_path = out_dir.join(&fs_path);
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -485,9 +579,14 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
             let mut buffer = vec![0u8; exp.serial_size as usize];
             cursor.read_exact(&mut buffer)?;
 
-            let out_path = write_extracted_file(&file_path, &buffer, pkg)?; 
+            let out_path = write_extracted_file(&file_path, &buffer, pkg)?;
 
-            println!("Exported \x1b[93m{}\x1b[0m (\x1b[33m{}\x1b[0m bytes) to\n\t \x1b[32m{}\x1b[0m", full_path, buffer.len(), out_path.display());
+            println!(
+                "Exported \x1b[93m{}\x1b[0m (\x1b[33m{}\x1b[0m bytes) to\n\t \x1b[32m{}\x1b[0m",
+                full_name,
+                buffer.len(),
+                out_path.display()
+            );
             found = true;
         }
     }
@@ -500,61 +599,34 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
     Ok(())
 }
 
-pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<Names>
+pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<NameEntry>
 {
-    let len = cursor.read_i32::<LittleEndian>()?;
-    
-    if len == 0
-    {
-        return Ok(Names{n_len: 0, is_utf16: false, name: "".to_string(), name_bytes: Vec::new(), n_fh: 0, n_fl: 0})
-    }
+    let length = cursor.read_i32::<LittleEndian>()?;
 
-    if len > 0
-    {
-        let mut buf = vec![0u8; len as usize];
-        cursor.read_exact(&mut buf)?;
+    let name = if length < 0 {
 
-        let n_fh = cursor.read_i32::<LittleEndian>()?;
-        let n_fl = cursor.read_i32::<LittleEndian>()?;
-
-        if buf.last() == Some(&0)
-        {
-            buf.pop();
+        let abs_length = (-length) as usize;
+        let mut u16_chars = vec![0u16; abs_length];
+        for i in 0..abs_length {
+            u16_chars[i] = cursor.read_u16::<LittleEndian>()?;
         }
-
-        let name = buf.iter().map(|&b| b as char).collect::<String>(); // ISO-8859-1
-
-        Ok(Names
-        {
-            n_len: len, is_utf16: false, name, name_bytes: buf, n_fh, n_fl
-        })
-
+        String::from_utf16(&u16_chars[..abs_length.saturating_sub(1)])
+            .unwrap_or_else(|_| String::from("<invalid_utf16>"))
     } else {
-        let wchar_count = -len;
-        let mut buf = vec![0u8; (wchar_count * 2) as usize];
-        cursor.read_exact(&mut buf)?;
-
-        let n_fh = cursor.read_i32::<LittleEndian>()?;
-        let n_fl = cursor.read_i32::<LittleEndian>()?;
-
-        let utf16: Vec<u16> = buf
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        let length = length as usize;
+        let mut bytes = vec![0u8; length];
+        cursor.read_exact(&mut bytes)?;
+        let name: String = bytes[..length.saturating_sub(1)]
+            .iter()
+            .map(|&b| b as char)
             .collect();
 
-        let utf16_trimmed = match utf16.last()
-        {
-            Some(&0) => &utf16[..utf16.len() - 1],
-            _ => &utf16[..]
-        };
+        name
+    };
 
-        let name = String::from_utf16(utf16_trimmed)
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"))?;
-        Ok(Names
-        {
-            n_len: wchar_count, is_utf16: true, name, name_bytes: buf, n_fh, n_fl
-        })
-    }
+    let flags = cursor.read_u64::<LittleEndian>()?;
+
+    Ok(NameEntry { name, flags })
 }
 
 pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>

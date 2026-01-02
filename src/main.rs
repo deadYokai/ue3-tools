@@ -1,8 +1,6 @@
 use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
-use byteorder::{LittleEndian, ReadBytesExt};
 use ron::{ser::{to_string_pretty, PrettyConfig}};
-use upkreader::parse_upk;
-use crate::{upkdecompress::{upk_decompress, CompressedChunk, CompressionMethod}, upkreader::{get_obj_props, PackageFlags, UPKPak, UpkHeader}};
+use crate::{upkdecompress::{upk_decompress, CompressionMethod}, upkreader::{get_obj_props, PackageFlags, UPKPak, UpkHeader}};
 use clap::{Parser, Subcommand};
 
 mod upkreader;
@@ -10,6 +8,7 @@ mod upkpacker;
 mod upkdecompress;
 mod upkprops;
 mod upkfont;
+mod scriptpatcher;
 
 fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
 {
@@ -109,7 +108,7 @@ fn getlist(path: &str) -> Result<()>
     let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
 
-    let pak = parse_upk(&mut cur, &header)?;
+    let pak = UPKPak::parse_upk(&mut cur, &header)?;
     let list = upkreader::list_full_obj_paths(&pak);
     for (i, path) in list.iter().enumerate()
     {
@@ -163,7 +162,7 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
 
     let (mut cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(upk_path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
-    let up = upkreader::parse_upk(&mut cur, &header)?;
+    let up = UPKPak::parse_upk(&mut cur, &header)?;
 
     if !dir_path.exists() {
         std::fs::create_dir_all(dir_path)?;

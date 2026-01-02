@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::upkreader::PACKAGE_TAG;
 
-pub const CHUNK_SIZE: u32 = 131072;
+pub const CHUNK_SIZE: u32 = 131072; // default in Unreal Engine 3
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Copy, Clone)]
 #[repr(u32)]
