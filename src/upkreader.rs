@@ -6,6 +6,9 @@ use serde::{Serialize, Deserialize};
 use bitflags::bitflags;
 use crate::{upkdecompress::{CompressedChunk, CompressionMethod}, upkprops::{self, Property, PropertyValue}};
 
+use crate::scriptdisasm::{disasm_function, extract_script_from_export_blob, print_disasm};
+
+
 pub const PACKAGE_TAG: u32 = 0x9E2A83C1;
 
 bitflags! {
@@ -68,28 +71,63 @@ pub struct NameEntry
    pub flags: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
 pub struct FName {
-    name_index: i32,
-    name_instance: i32
+    pub name_index: i32,
+    pub name_instance: i32
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Export
 {
-    class_index: i32,
-    super_index: i32,
-    outer_index: i32,
-    object_name: FName,
-    archetype: i32,
-    object_flags: u64,
-    serial_size: i32,
-    serial_offset: i32,
-    legacy_component_map: HashMap<FName, i32>,
-    export_flags: u32,
-    generation_net_object_count: Vec<i32>,
-    package_guid: [i32; 4],
-    package_flags: u32
+    pub class_index: i32,
+    pub super_index: i32,
+    pub outer_index: i32,
+    pub object_name: FName,
+    pub archetype: i32,
+    pub object_flags: u64,
+    pub serial_size: i32,
+    pub serial_offset: i32,
+    pub legacy_component_map: HashMap<FName, i32>,
+    pub export_flags: u32,
+    pub generation_net_object_count: Vec<i32>,
+    pub package_guid: [i32; 4],
+    pub package_flags: u32
+}
+
+pub fn resolve_object_refs(props: &mut Vec<Property>, pkg: &UPKPak) {
+    for prop in props.iter_mut() {
+        resolve_value(&mut prop.value, pkg);
+    }
+}
+
+fn resolve_value(val: &mut PropertyValue, pkg: &UPKPak) {
+    match val {
+        PropertyValue::Object(idx) => {
+            let name = if *idx > 0 {
+                pkg.get_export_full_name(*idx)
+            } else if *idx < 0 {
+                pkg.get_import_full_name(*idx)
+            } else {
+                "None".to_string()
+            };
+            *val = PropertyValue::String(name);
+        }
+        PropertyValue::Array(elements) => {
+            for el in elements.iter_mut() {
+                resolve_value(el, pkg);
+            }
+        }
+        PropertyValue::Struct(fields) => {
+            for (_, v) in fields.iter_mut() {
+                resolve_value(v, pkg);
+            }
+        }
+        PropertyValue::Name(fname) => {
+            *val = PropertyValue::String(pkg.fname_to_string(fname));
+        }
+        _ => {}
+    }
 }
 
 impl Export {
@@ -482,83 +520,133 @@ pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String> {
         .collect()
 }
 
-pub fn write_extracted_file(path: &Path, buf: &[u8], pkg: &UPKPak) -> Result<PathBuf> {    
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap();
-    let name = path.file_stem().and_then(|s| s.to_str()).unwrap();
-    let dir = path.parent().unwrap();
+pub fn write_extracted_file(
+    path: &Path,
+    buf: &[u8],
+    pkg: &UPKPak,
+    ver: i16
+) -> Result<PathBuf> {    
+    let ext  = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("obj");
+    let dir  = path.parent().unwrap();
     let mut new_path = dir.join(name);
 
     match ext {
-        "ObjectReferencer" => {
-            let buf_vec = buf.to_vec();
-            let mut cursor = Cursor::new(&buf_vec);
-            let props = get_obj_props(&mut cursor, pkg, false)?;
-            let config = PrettyConfig::new().struct_names(true);
-            let data = (format!("{}.{}", name, ext), &props);
-            let ron_string = to_string_pretty(&data, config).unwrap();
+        "Function" | "ScriptFunction" => {
+            let mut out_file = File::create(path)?;
+            out_file.write_all(buf)?;
+            new_path = path.to_path_buf();
 
-            new_path = new_path.with_extension("ron");
-            let mut ron_file = File::create(&new_path)?;
-            writeln!(ron_file, "{ron_string}")?;
-        },
+            match extract_script_from_export_blob(buf, pkg) {
+                Some(script) => {
+                    let stmts = disasm_function(&script, pkg);
+                    if !stmts.is_empty() {
+                        let text     = print_disasm(&stmts);
+                        let asm_path = path.with_extension("asm");
+                        let mut asm_file = File::create(&asm_path)?;
+                        asm_file.write_all(text.as_bytes())?;
+                        println!(
+                            "  \x1b[36mdisasm\x1b[0m → \x1b[32m{}\x1b[0m  ({} stmts)",
+                            asm_path.display(), stmts.len()
+                        );
+                    }
+                }
+                None => {
+                    eprintln!("  \x1b[33mwarn\x1b[0m: could not locate Script in {}", path.display());
+                }
+            }
+        }
+
         "SwfMovie" | "GFxMovieInfo" => {
             let buf_vec = buf.to_vec();
             let mut cursor = Cursor::new(&buf_vec);
-            let mut props = get_obj_props(&mut cursor, pkg, false)?;
+            let (mut props, _) = get_obj_props(&mut cursor, pkg, false, ver)?;
 
-            let rawdata_find: &Property = props.iter().find(|s| s.name == "RawData").unwrap();
-            let rawdata = rawdata_find.value.as_vec();
+            let rawdata_bytes: Option<Vec<u8>> = props
+                .iter()
+                .find(|p| p.name == "RawData")
+                .and_then(|p| p.value.as_vec())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|el| el.as_byte())
+                        .collect()
+                });
 
-            let mut file_buffer = Vec::<u8>::new();
-            
-            {
-                let mut writer = BufWriter::new(&mut file_buffer);
-
-                if let Some(data) = rawdata {
-                    for b in data.iter() {
-                        if let Some(byte) = b.as_byte() {
-                            writer.write_u8(byte)?;
-                        }
-                    }
-                    
-                }
-
-                writer.flush()?;
-            }
-
-            if file_buffer.is_empty() {
-                let mut out_file = File::create(path)?;
-                new_path = path.to_path_buf();
-                out_file.write_all(buf)?;
-            } else {
+            if let Some(bytes) = rawdata_bytes.filter(|b| !b.is_empty()) {
+                // Replace the RawData value with a filename reference.
                 for prop in props.iter_mut() {
                     if prop.name == "RawData" {
                         prop.value = PropertyValue::String(format!("{}.gfx", name));
                     }
                 }
-                let config = PrettyConfig::new().struct_names(true);
-                let data = (format!("{}.{}", name, ext), &props);
-                let ron_string = to_string_pretty(&data, config).unwrap();
+                resolve_object_refs(&mut props, pkg);
 
-                let mut ron_file = File::create(new_path.with_extension("ron"))?;
-                writeln!(ron_file, "{ron_string}")?;
+                let ron_string = to_string_pretty(
+                    &(format!("{}.{}", name, ext), &props),
+                    PrettyConfig::new().struct_names(true),
+                ).unwrap();
 
-                new_path = new_path.with_extension("gfx");
-                let mut file = File::create(&new_path)?;
-                file.write_all(&file_buffer)?;
+                new_path = new_path.with_extension("ron");
+                writeln!(File::create(&new_path)?, "{ron_string}")?;
+
+                let gfx_path = dir.join(format!("{}.gfx", name));
+                File::create(&gfx_path)?.write_all(&bytes)?;
+            } else {
+                let mut out_file = File::create(path)?;
+                out_file.write_all(buf)?;
+                new_path = path.to_path_buf();
             }
         }
+
         _ => {
-            let mut out_file = File::create(path)?;
-            new_path = path.to_path_buf();
-            out_file.write_all(buf)?;
+            let buf_vec    = buf.to_vec();
+            let mut cursor = Cursor::new(&buf_vec);
+
+            let (mut props, props_end) =
+                get_obj_props(&mut cursor, pkg, false, ver)?;
+
+            let tail = &buf_vec[props_end as usize..];
+
+            resolve_object_refs(&mut props, pkg);
+
+            let config = PrettyConfig::new().struct_names(true);
+
+            if !props.is_empty() && !(props.len() == 1 && props[0].name == "None") {
+                if !tail.is_empty() {
+                    let bin_name = format!("{}.bin", name);
+                    let bin_path = dir.join(&bin_name);
+                    File::create(&bin_path)?.write_all(tail)?;
+                    println!(
+                        "  \x1b[35mbinary\x1b[0m → \x1b[32m{}\x1b[0m  ({} bytes)",
+                        bin_path.display(), tail.len()
+                    );
+
+                    let ron_string = to_string_pretty(
+                        &(format!("{}.{}", name, ext), &props, &bin_name),
+                        config,
+                    ).unwrap();
+                    new_path = new_path.with_extension("ron");
+                    writeln!(File::create(&new_path)?, "{ron_string}")?;
+                } else {
+                    let ron_string = to_string_pretty(
+                        &(format!("{}.{}", name, ext), &props),
+                        config,
+                    ).unwrap();
+                    new_path = new_path.with_extension("ron");
+                    writeln!(File::create(&new_path)?, "{ron_string}")?;
+                }
+            } else {
+                let mut out_file = File::create(path)?;
+                out_file.write_all(buf)?;
+                new_path = path.to_path_buf();
+            }
         }
     }
 
     Ok(new_path)
 }
 
-pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: &Path, all: bool) -> Result<()> {
+pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: &Path, all: bool, ver: i16) -> Result<()> {
 
     let mut found = false;
 
@@ -579,7 +667,7 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
             let mut buffer = vec![0u8; exp.serial_size as usize];
             cursor.read_exact(&mut buffer)?;
 
-            let out_path = write_extracted_file(&file_path, &buffer, pkg)?;
+            let out_path = write_extracted_file(&file_path, &buffer, pkg, ver)?;
 
             println!(
                 "Exported \x1b[93m{}\x1b[0m (\x1b[33m{}\x1b[0m bytes) to\n\t \x1b[32m{}\x1b[0m",
@@ -672,27 +760,41 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
 pub fn get_obj_props(
     cursor: &mut Cursor<&Vec<u8>>,
     upk: &UPKPak,
-    print_out: bool
-) -> Result<Vec<Property>>
-{
+    print_out: bool,
+    ver: i16,
+) -> Result<(Vec<Property>, u64)> {
     let mut props = Vec::new();
-    while let Some(prop) = upkprops::parse_property(cursor, upk).expect("get_obj_props") {
-        let start_pos = cursor.position();
-        
-        if print_out {
-            println!("{:?}", prop);
-        }
+    let mut last_pos = cursor.position();
 
-        props.push(prop);
+    loop {
+        let before = cursor.position();
 
-        if cursor.position() >= cursor.seek(std::io::SeekFrom::End(0))?{
-            break;
+        let result = upkprops::parse_property(cursor, upk, ver);
+
+        match result {
+            Err(_) => {
+                cursor.set_position(last_pos);
+                break;
+            }
+            Ok(None) => {
+                cursor.set_position(before);
+                break;
+            }
+            Ok(Some(prop)) => {
+                if print_out {
+                    println!("{:?}", prop);
+                }
+                last_pos = cursor.position();
+                let is_none = prop.name == "None";
+                props.push(prop);
+                if is_none { break; }
+            }
         }
-        cursor.seek(std::io::SeekFrom::Start(start_pos))?;
     }
 
-    Ok(props)    
+    Ok((props, cursor.position()))
 }
+
 
 impl fmt::Display for UpkHeader 
 {

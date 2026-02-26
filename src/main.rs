@@ -9,6 +9,8 @@ mod upkdecompress;
 mod upkprops;
 mod upkfont;
 mod scriptpatcher;
+mod scriptcompiler;
+mod scriptdisasm;
 
 fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
 {
@@ -50,16 +52,18 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
 
             cloned_header.write(&mut writer)?;
 
-
-
-            if first_chunk_offset > end_header_offest {
-                let pre_data_len = first_chunk_offset - end_header_offest - (chunks.len() * 16);
-                reader.seek(SeekFrom::Start((end_header_offest + (chunks.len() * 16)) as u64))?;
-                let mut pre_data = vec![0u8; pre_data_len];
-                reader.read_exact(&mut pre_data)?;
-                writer.write_all(&pre_data)?;
-            }
-            
+            //
+            // println!("{:?} {:?}", first_chunk_offset, end_header_offest);
+            // // TODO: hmm, 4 zerobytes, need find what it is
+            //
+            // if first_chunk_offset > end_header_offest {
+            //     let pre_data_len = first_chunk_offset - end_header_offest - (chunks.len() * 16);
+            //     reader.seek(SeekFrom::Start((end_header_offest + (chunks.len() * 16)) as u64))?;
+            //     let mut pre_data = vec![0u8; pre_data_len];
+            //     reader.read_exact(&mut pre_data)?;
+            //     writer.write_all(&pre_data)?;
+            // }
+            // 
             for (i, c) in dec_data.iter().enumerate() {
                 if i != 0 {
                     let prev = chunks[i-1].compressed_offset +
@@ -179,10 +183,134 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
     // let s = to_string_pretty(&up, pretty).expect("Fail");
     // writeln!(data_file, "{s}")?;
 
-    upkreader::extract_by_name(&mut cursor, &up, path, dir_path, all)?;
+    upkreader::extract_by_name(&mut cursor, &up, path, dir_path, all, header.p_ver)?;
 
     Ok(())
 }
+
+fn make_script_patch(
+    package_name: &str,
+    struct_name: &str,
+    function_path: &str,
+    bytecode_file: &str,
+    output_dir: &str,
+) -> Result<()> {
+    use crate::scriptpatcher::{LinkerPatchData, ScriptPatchData};
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+
+    let bytecode = fs::read(bytecode_file)?;
+
+    let mut patch = LinkerPatchData::new(package_name.to_string());
+    patch.add_script_patch(ScriptPatchData::new(
+        struct_name.to_string(),
+        function_path.to_string(),
+        bytecode,
+    ));
+
+    let mut uncompressed: Vec<u8> = Vec::new();
+    patch.serialize(&mut uncompressed)?;
+
+    let block_size: usize = 0x20000;
+    let uncompressed_total = uncompressed.len() as u32;
+    let blocks: Vec<Vec<u8>> = uncompressed
+        .chunks(block_size)
+        .map(|chunk| {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(chunk).unwrap();
+            enc.finish().unwrap()
+        })
+        .collect();
+
+    let compressed_total: u32 = blocks.iter().map(|b| b.len() as u32).sum();
+
+    let mut out_buf: Vec<u8> = Vec::new();
+    out_buf.write_all(&uncompressed_total.to_le_bytes())?;
+    out_buf.write_all(&compressed_total.to_le_bytes())?;
+    for (i, block) in blocks.iter().enumerate() {
+        let unc_size = if i == blocks.len() - 1 {
+            uncompressed.len() - i * block_size
+        } else {
+            block_size
+        };
+        out_buf.write_all(&(block.len() as u32).to_le_bytes())?;
+        out_buf.write_all(&(unc_size as u32).to_le_bytes())?;
+    }
+    for block in &blocks {
+        out_buf.write_all(block)?;
+    }
+
+    let out_path = Path::new(output_dir);
+    fs::create_dir_all(out_path)?;
+    let bin_path = out_path.join(format!("ScriptPatch_{}.bin", package_name));
+    fs::write(&bin_path, &out_buf)?;
+    println!("Wrote patch: {}", bin_path.display());
+
+    Ok(())
+}
+
+fn disasm_function_cmd(upk_path: &str, function_path: &str, output_dir: &str) -> Result<()> {
+    let (mut cursor, header) = upk_header_cursor(upk_path)?;
+    let mut cur = Cursor::new(cursor.get_ref());
+    let pak = UPKPak::parse_upk(&mut cur, &header)?;
+
+    // Find the export whose full name matches function_path.
+    let needle = function_path.to_lowercase();
+    let export_entry = pak.export_table.iter().enumerate().find(|(idx, _)| {
+        let full = pak.get_export_full_name((*idx + 1) as i32);
+        full.to_lowercase().contains(&needle)
+    });
+
+    let (exp_idx, _) = match export_entry {
+        Some(e) => e,
+        None => {
+            eprintln!("No export matching '{}' found in {}", function_path, upk_path);
+            return Ok(());
+        }
+    };
+
+    let exp        = &pak.export_table[exp_idx];
+    let full_name  = pak.get_export_full_name((exp_idx + 1) as i32);
+    let class_name = pak.get_class_name(exp.class_index);
+
+    if class_name != "Function" && class_name != "ScriptFunction" {
+        eprintln!(
+            "Export '{}' has class '{}', not a script function.",
+            full_name, class_name
+        );
+        return Ok(());
+    }
+
+    // Read the raw serial blob.
+    cursor.seek(SeekFrom::Start(exp.serial_offset as u64))?;
+    let mut blob = vec![0u8; exp.serial_size as usize];
+    cursor.read_exact(&mut blob)?;
+
+    // Extract and disassemble the Script TArray.
+    let script = scriptdisasm::extract_script_from_export_blob(&blob, &pak)
+        .unwrap_or_else(|| {
+            eprintln!("warn: could not locate Script array; disassembling raw blob");
+            blob.clone()
+        });
+
+    let stmts = scriptdisasm::disasm_function(&script, &pak);
+    let text  = scriptdisasm::print_disasm(&stmts);
+    println!("{}", text);
+
+    // Write .asm file.
+    let out_dir = Path::new(output_dir);
+    let upk_stem = Path::new(upk_path).file_stem().unwrap().to_str().unwrap();
+    let fn_name  = function_path.rsplit(['/', '.']).next().unwrap_or(function_path);
+    let dir_path = out_dir.join(upk_stem);
+    std::fs::create_dir_all(&dir_path)?;
+    let asm_path = dir_path.join(format!("{}.asm", fn_name));
+    std::fs::write(&asm_path, &text)?;
+    println!("Wrote: {}", asm_path.display());
+
+    Ok(())
+}
+
+
 
 fn pack_upk(_ron_path: &str) -> Result<()> {
     unimplemented!("For now");
@@ -204,10 +332,11 @@ fn print_obj_elements(ron_path: &str, path: &str) -> Result<()> {
     let ron_data: (String, String, UpkHeader, UPKPak) = ron::from_str(&ron_file).expect("RON Error");
     
     let upk: UPKPak = ron_data.3;
+    let header: UpkHeader = ron_data.2;
     let el_data = fs::read(path)?;
     let mut cursor = Cursor::new(&el_data);
 
-    get_obj_props(&mut cursor, &upk, true)?;
+    let (_, _) = get_obj_props(&mut cursor, &upk, true, header.p_ver)?;
     
     Ok(())
 }
@@ -259,7 +388,32 @@ enum Commands {
 
     Pack {
         ron_path: String
-    }
+    },
+
+    #[command(about = "Create script patch bin")]
+    MakeScriptPatch {
+        package_name: String,
+        struct_name: String,
+        function_path: String,
+        bytecode_file: String,
+        output_dir: Option<String>
+    },
+
+    #[command(about = "Disassemble UnrealScript bytecode from a UPK function")]
+    Disasm {
+        upk_path: String,
+        /// Full object path, e.g. "MyPackage.MyClass.MyFunction"
+        function_path: String,
+        output_dir: Option<String>,
+    },
+
+    /// Compile an assembly text file to raw UnrealScript bytecode.
+    #[command(about = "Compile bytecode assembly text to .bin for MakeScriptPatch")]
+    Compile {
+        upk_path: String,
+        asm_file: String,
+        output_file: Option<String>,
+    },
 }
 
 fn main() -> Result<()> 
@@ -284,7 +438,22 @@ fn main() -> Result<()>
             let out = output_dir.as_deref().unwrap_or("");
             extract_file(&upk_path, "", out, true)?
         },
-        Commands::Pack { .. } => unimplemented!()
+        Commands::Pack { .. } => unimplemented!(),
+        Commands::MakeScriptPatch
+            { package_name, struct_name, function_path, bytecode_file, output_dir } => 
+        {
+            let out = output_dir.as_deref().unwrap_or("Patches");
+            make_script_patch
+                (&package_name, &struct_name, &function_path, &bytecode_file, out)?;
+        },
+        Commands::Disasm { upk_path, function_path, output_dir } => {
+            let out = output_dir.as_deref().unwrap_or("output");
+            disasm_function_cmd(&upk_path, &function_path, out)?;
+        }
+        Commands::Compile { upk_path, asm_file, output_file } => {
+            unimplemented!()
+        }
+
     }
 
     Ok(())
