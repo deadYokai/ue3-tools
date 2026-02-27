@@ -195,57 +195,20 @@ fn make_script_patch(
     bytecode_file: &str,
     output_dir: &str,
 ) -> Result<()> {
-    use crate::scriptpatcher::{LinkerPatchData, ScriptPatchData};
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
+    use crate::scriptpatcher::{compress_patch, LinkerPatchData, ScriptPatchData};
 
     let bytecode = fs::read(bytecode_file)?;
-
     let mut patch = LinkerPatchData::new(package_name.to_string());
     patch.add_script_patch(ScriptPatchData::new(
         struct_name.to_string(),
         function_path.to_string(),
         bytecode,
     ));
-
-    let mut uncompressed: Vec<u8> = Vec::new();
-    patch.serialize(&mut uncompressed)?;
-
-    let block_size: usize = 0x20000;
-    let uncompressed_total = uncompressed.len() as u32;
-    let blocks: Vec<Vec<u8>> = uncompressed
-        .chunks(block_size)
-        .map(|chunk| {
-            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-            enc.write_all(chunk).unwrap();
-            enc.finish().unwrap()
-        })
-        .collect();
-
-    let compressed_total: u32 = blocks.iter().map(|b| b.len() as u32).sum();
-
-    let mut out_buf: Vec<u8> = Vec::new();
-    out_buf.write_all(&uncompressed_total.to_le_bytes())?;
-    out_buf.write_all(&compressed_total.to_le_bytes())?;
-    for (i, block) in blocks.iter().enumerate() {
-        let unc_size = if i == blocks.len() - 1 {
-            uncompressed.len() - i * block_size
-        } else {
-            block_size
-        };
-        out_buf.write_all(&(block.len() as u32).to_le_bytes())?;
-        out_buf.write_all(&(unc_size as u32).to_le_bytes())?;
-    }
-    for block in &blocks {
-        out_buf.write_all(block)?;
-    }
-
-    let out_path = Path::new(output_dir);
-    fs::create_dir_all(out_path)?;
-    let bin_path = out_path.join(format!("ScriptPatch_{}.bin", package_name));
-    fs::write(&bin_path, &out_buf)?;
-    println!("Wrote patch: {}", bin_path.display());
-
+    let bin = compress_patch(&patch)?;
+    fs::create_dir_all(output_dir)?;
+    let out = Path::new(output_dir).join(format!("ScriptPatch_{}.bin", package_name));
+    fs::write(&out, &bin)?;
+    println!("Wrote patch: {}", out.display());
     Ok(())
 }
 
@@ -310,7 +273,65 @@ fn disasm_function_cmd(upk_path: &str, function_path: &str, output_dir: &str) ->
     Ok(())
 }
 
+fn compile_asm(upk_path: &str, asm_file: &str, output_file: &str) -> Result<()> {
+    let text = fs::read_to_string(asm_file)?;
+    let (mut cursor, header) = upk_header_cursor(upk_path)?;
+    let mut cur = Cursor::new(cursor.get_ref());
+    let pak = UPKPak::parse_upk(&mut cur, &header)?;
+    let mut compiler = scriptcompiler::Compiler::new(&pak);
+    let bytecode = compiler.compile_text(&text)?;
+    fs::write(output_file, &bytecode)?;
+    println!("Compiled {} bytes → {}", bytecode.len(), output_file);
+    Ok(())
+}
 
+fn make_object_patch(
+    package_name: &str,
+    object_path: &str,   // e.g. "DishonoredGame.DishWeaponSword"
+    data_file: &str,     // raw serialized property data (tagged properties blob)
+    output_dir: &str,
+) -> Result<()> {
+    use crate::scriptpatcher::{compress_patch, LinkerPatchData, PatchData};
+
+    let data = fs::read(data_file)?;
+    let mut patch = LinkerPatchData::new(package_name.to_string());
+    patch.add_cdo_patch(PatchData::new(object_path.to_string(), data));
+    let bin = compress_patch(&patch)?;
+    fs::create_dir_all(output_dir)?;
+    let out = Path::new(output_dir).join(format!("ScriptPatch_{}.bin", package_name));
+    fs::write(&out, &bin)?;
+    println!("Wrote CDO patch: {}", out.display());
+    Ok(())
+}
+
+// ── NEW: apply a .bin patch directly to a UPK file (offline) ────────────────
+fn apply_patch_cmd(patch_file: &str, upk_path: &str, output_path: Option<&str>) -> Result<()> {
+    use crate::scriptpatcher::{apply_patches_to_upk, load_patch_bin};
+
+    let bin = fs::read(patch_file)?;
+    let patch = load_patch_bin(&bin)?;
+
+    println!("Patch: package={}", patch.package_name);
+    println!("  {} script patch(es)", patch.script_patches.len());
+    println!("  {} CDO patch(es)", patch.modified_class_default_objects.len());
+    println!("  {} enum patch(es)", patch.modified_enums.len());
+    println!("  {} new object(s)", patch.new_objects.len());
+
+    let (cursor, header) = upk_header_cursor(upk_path)?;
+    let upk_raw = cursor.into_inner();
+    let mut cur: Cursor<&Vec<u8>> = Cursor::new(&upk_raw);
+    let pak = UPKPak::parse_upk(&mut cur, &header)?;
+
+    let patched = apply_patches_to_upk(&upk_raw, &header, &pak, &patch)?;
+
+    let out = output_path.map(|s| s.to_string()).unwrap_or_else(|| {
+        let stem = Path::new(upk_path).file_stem().unwrap().to_str().unwrap();
+        format!("{}.patched.upk", stem)
+    });
+    fs::write(&out, &patched)?;
+    println!("Wrote patched UPK: {}", out);
+    Ok(())
+}
 
 fn pack_upk(_ron_path: &str) -> Result<()> {
     unimplemented!("For now");
@@ -414,6 +435,20 @@ enum Commands {
         asm_file: String,
         output_file: Option<String>,
     },
+
+    MakeObjectPatch {
+        package_name: String,
+        object_path: String,
+        data_file: String,
+        output_dir: Option<String>
+    },
+
+    #[command(about = "Apply a script patch .bin directly to a UPK file")]
+    ApplyPatch {
+        patch_file: String,
+        upk_path: String,
+        output_path: Option<String>,
+    },
 }
 
 fn main() -> Result<()> 
@@ -442,7 +477,7 @@ fn main() -> Result<()>
         Commands::MakeScriptPatch
             { package_name, struct_name, function_path, bytecode_file, output_dir } => 
         {
-            let out = output_dir.as_deref().unwrap_or("Patches");
+            let out = output_dir.as_deref().unwrap_or("patches");
             make_script_patch
                 (&package_name, &struct_name, &function_path, &bytecode_file, out)?;
         },
@@ -451,7 +486,15 @@ fn main() -> Result<()>
             disasm_function_cmd(&upk_path, &function_path, out)?;
         }
         Commands::Compile { upk_path, asm_file, output_file } => {
-            unimplemented!()
+            let out = output_file.as_deref().unwrap_or("output.bin");
+            compile_asm(&upk_path, &asm_file, out)?;
+        }
+        Commands::MakeObjectPatch { package_name, object_path, data_file, output_dir } => {
+            let out = output_dir.as_deref().unwrap_or("patches");
+            make_object_patch(&package_name, &object_path, &data_file, out)?;
+        }
+        Commands::ApplyPatch { patch_file, upk_path, output_path } => {
+            apply_patch_cmd(&patch_file, &upk_path, output_path.as_deref())?;
         }
 
     }
