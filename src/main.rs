@@ -1,19 +1,25 @@
-use std::{fs::{self, File}, io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write}, path::Path};
-use ron::{ser::{to_string_pretty, PrettyConfig}};
-use crate::{upkdecompress::{upk_decompress, CompressionMethod}, upkreader::{get_obj_props, PackageFlags, UPKPak, UpkHeader}};
+use crate::{
+    upkdecompress::{CompressionMethod, upk_decompress},
+    upkreader::{PackageFlags, UPKPak, UpkHeader, get_obj_props},
+};
 use clap::{Parser, Subcommand};
+use ron::ser::{PrettyConfig, to_string_pretty};
+use std::{
+    fs::{self, File},
+    io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write},
+    path::Path,
+};
 
-mod upkreader;
-mod upkpacker;
-mod upkdecompress;
-mod upkprops;
-mod upkfont;
-mod scriptpatcher;
 mod scriptcompiler;
 mod scriptdisasm;
+mod scriptpatcher;
+mod upkdecompress;
+mod upkfont;
+mod upkpacker;
+mod upkprops;
+mod upkreader;
 
-fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)>
-{
+fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)> {
     let path = Path::new(path);
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -25,12 +31,9 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
     println!("{}", header);
 
     let end_header_offest = reader.stream_position()? as usize;
-     
-    if header.compression_method != CompressionMethod::None 
-    {
 
+    if header.compression_method != CompressionMethod::None {
         if header.compressed_chunks_count != 0 {
-
             println!("File is compressed, trying decompress...");
 
             let mut cloned_header = header.clone();
@@ -45,7 +48,7 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
             let first_chunk_offset = chunks[0].compressed_offset as usize;
 
             let dec_data = upk_decompress(&mut reader, header.compression_method, &chunks)
-                .expect("Decompression error"); 
+                .expect("Decompression error");
 
             let file = File::create(".tmp.upk")?;
             let mut writer = BufWriter::new(file);
@@ -63,11 +66,10 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
             //     reader.read_exact(&mut pre_data)?;
             //     writer.write_all(&pre_data)?;
             // }
-            // 
+            //
             for (i, c) in dec_data.iter().enumerate() {
                 if i != 0 {
-                    let prev = chunks[i-1].compressed_offset +
-                        chunks[i-1].compressed_size;
+                    let prev = chunks[i - 1].compressed_offset + chunks[i - 1].compressed_size;
 
                     let diff = chunks[i].compressed_offset - prev;
 
@@ -82,16 +84,15 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
                 writer.write_all(c)?;
             }
 
-            let last = chunks[chunks.len() - 1].compressed_offset +
-                chunks[chunks.len() - 1].compressed_size;
+            let last = chunks[chunks.len() - 1].compressed_offset
+                + chunks[chunks.len() - 1].compressed_size;
 
             if filesize > last as u64 {
-                 reader.seek(SeekFrom::Start(last as u64))?;
-                 let mut data = vec![0u8; (filesize - last as u64) as usize];
-                 reader.read_exact(&mut data)?;
-                 writer.write_all(&data)?;
+                reader.seek(SeekFrom::Start(last as u64))?;
+                let mut data = vec![0u8; (filesize - last as u64) as usize];
+                reader.read_exact(&mut data)?;
+                writer.write_all(&data)?;
             }
- 
         }
 
         println!("File is decompressed. Reopening file");
@@ -107,26 +108,21 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
     Ok((Cursor::new(buf), header))
 }
 
-fn getlist(path: &str) -> Result<()>
-{
+fn getlist(path: &str) -> Result<()> {
     let (cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
 
     let pak = UPKPak::parse_upk(&mut cur, &header)?;
     let list = upkreader::list_full_obj_paths(&pak);
-    for (i, path) in list.iter().enumerate()
-    {
+    for (i, path) in list.iter().enumerate() {
         println!("#{} {}", i, path);
     }
 
     Ok(())
 }
 
-fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
-{
-
-    if output_path.is_empty()
-    {
+fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()> {
+    if output_path.is_empty() {
         output_path = "names_table.txt";
     }
 
@@ -139,8 +135,7 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
     let nt_file = File::create(Path::new(output_path))?;
     let mut writer = BufWriter::new(nt_file);
 
-    for i in 0..header.name_count
-    {
+    for i in 0..header.name_count {
         let s = upkreader::read_name(&mut cur)?;
         println!("Name[{}]: {}", i, s.name);
         writeln!(writer, "{}", s.name)?;
@@ -150,28 +145,26 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()>
 }
 
 fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> Result<()> {
-    
-    if output_dir.is_empty()
-    {
+    if output_dir.is_empty() {
         output_dir = "output";
     }
 
     let output_dir_path = Path::new(output_dir);
-    
+
     let filename = Path::new(upk_path).file_stem().unwrap();
 
-    
     let pbuf = output_dir_path.join(filename);
     let dir_path: &Path = pbuf.as_path();
 
-    let (mut cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) = upk_header_cursor(upk_path)?;
+    let (mut cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) =
+        upk_header_cursor(upk_path)?;
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
     let up = UPKPak::parse_upk(&mut cur, &header)?;
 
     if !dir_path.exists() {
         std::fs::create_dir_all(dir_path)?;
     }
-    
+
     let mut data_file = File::create(pbuf.with_extension("ron"))?;
 
     let config = PrettyConfig::new().struct_names(true);
@@ -195,7 +188,7 @@ fn make_script_patch(
     bytecode_file: &str,
     output_dir: &str,
 ) -> Result<()> {
-    use crate::scriptpatcher::{compress_patch, LinkerPatchData, ScriptPatchData};
+    use crate::scriptpatcher::{LinkerPatchData, ScriptPatchData, compress_patch};
 
     let bytecode = fs::read(bytecode_file)?;
     let mut patch = LinkerPatchData::new(package_name.to_string());
@@ -227,13 +220,16 @@ fn disasm_function_cmd(upk_path: &str, function_path: &str, output_dir: &str) ->
     let (exp_idx, _) = match export_entry {
         Some(e) => e,
         None => {
-            eprintln!("No export matching '{}' found in {}", function_path, upk_path);
+            eprintln!(
+                "No export matching '{}' found in {}",
+                function_path, upk_path
+            );
             return Ok(());
         }
     };
 
-    let exp        = &pak.export_table[exp_idx];
-    let full_name  = pak.get_export_full_name((exp_idx + 1) as i32);
+    let exp = &pak.export_table[exp_idx];
+    let full_name = pak.get_export_full_name((exp_idx + 1) as i32);
     let class_name = pak.get_class_name(exp.class_index);
 
     if class_name != "Function" && class_name != "ScriptFunction" {
@@ -250,20 +246,22 @@ fn disasm_function_cmd(upk_path: &str, function_path: &str, output_dir: &str) ->
     cursor.read_exact(&mut blob)?;
 
     // Extract and disassemble the Script TArray.
-    let script = scriptdisasm::extract_script_from_export_blob(&blob, &pak)
-        .unwrap_or_else(|| {
-            eprintln!("warn: could not locate Script array; disassembling raw blob");
-            blob.clone()
-        });
+    let script = scriptdisasm::extract_script_from_export_blob(&blob, &pak).unwrap_or_else(|| {
+        eprintln!("warn: could not locate Script array; disassembling raw blob");
+        blob.clone()
+    });
 
     let stmts = scriptdisasm::disasm_function(&script, &pak);
-    let text  = scriptdisasm::print_disasm(&stmts);
+    let text = scriptdisasm::print_disasm(&stmts);
     println!("{}", text);
 
     // Write .asm file.
     let out_dir = Path::new(output_dir);
     let upk_stem = Path::new(upk_path).file_stem().unwrap().to_str().unwrap();
-    let fn_name  = function_path.rsplit(['/', '.']).next().unwrap_or(function_path);
+    let fn_name = function_path
+        .rsplit(['/', '.'])
+        .next()
+        .unwrap_or(function_path);
     let dir_path = out_dir.join(upk_stem);
     std::fs::create_dir_all(&dir_path)?;
     let asm_path = dir_path.join(format!("{}.asm", fn_name));
@@ -287,11 +285,11 @@ fn compile_asm(upk_path: &str, asm_file: &str, output_file: &str) -> Result<()> 
 
 fn make_object_patch(
     package_name: &str,
-    object_path: &str,   // e.g. "DishonoredGame.DishWeaponSword"
-    data_file: &str,     // raw serialized property data (tagged properties blob)
+    object_path: &str, // e.g. "DishonoredGame.DishWeaponSword"
+    data_file: &str,   // raw serialized property data (tagged properties blob)
     output_dir: &str,
 ) -> Result<()> {
-    use crate::scriptpatcher::{compress_patch, LinkerPatchData, PatchData};
+    use crate::scriptpatcher::{LinkerPatchData, PatchData, compress_patch};
 
     let data = fs::read(data_file)?;
     let mut patch = LinkerPatchData::new(package_name.to_string());
@@ -313,7 +311,10 @@ fn apply_patch_cmd(patch_file: &str, upk_path: &str, output_path: Option<&str>) 
 
     println!("Patch: package={}", patch.package_name);
     println!("  {} script patch(es)", patch.script_patches.len());
-    println!("  {} CDO patch(es)", patch.modified_class_default_objects.len());
+    println!(
+        "  {} CDO patch(es)",
+        patch.modified_class_default_objects.len()
+    );
     println!("  {} enum patch(es)", patch.modified_enums.len());
     println!("  {} new object(s)", patch.new_objects.len());
 
@@ -338,27 +339,26 @@ fn pack_upk(_ron_path: &str) -> Result<()> {
 }
 
 fn print_obj_elements(ron_path: &str, path: &str) -> Result<()> {
-    if path.is_empty()
-    {
+    if path.is_empty() {
         panic!("No object file provided");
     }
 
-    if ron_path.is_empty()
-    {
+    if ron_path.is_empty() {
         panic!("No `.ron` file provided");
     }
 
-    let ron_file = fs::read_to_string(ron_path)
-        .unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
-    let ron_data: (String, String, UpkHeader, UPKPak) = ron::from_str(&ron_file).expect("RON Error");
-    
+    let ron_file =
+        fs::read_to_string(ron_path).unwrap_or_else(|_| panic!("File `{}` not found", ron_path));
+    let ron_data: (String, String, UpkHeader, UPKPak) =
+        ron::from_str(&ron_file).expect("RON Error");
+
     let upk: UPKPak = ron_data.3;
     let header: UpkHeader = ron_data.2;
     let el_data = fs::read(path)?;
     let mut cursor = Cursor::new(&el_data);
 
     let (_, _) = get_obj_props(&mut cursor, &upk, true, header.p_ver)?;
-    
+
     Ok(())
 }
 
@@ -367,48 +367,48 @@ fn print_obj_elements(ron_path: &str, path: &str) -> Result<()> {
 #[command(about = "Unreal3 upk stuff")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Print header info of upk file")]
     UpkHeader {
-        path: String
+        path: String,
     },
 
     #[command(about = "Print elements in object")]
     Elements {
         ron_path: String,
-        path: String
+        path: String,
     },
 
     #[command(about = "Print list of objects in upk file")]
     List {
-        path: String
+        path: String,
     },
 
     #[command(about = "Print or extract names in upk file")]
     Names {
         path: String,
-        output_path: Option<String>
+        output_path: Option<String>,
     },
 
     #[command(about = "Extract specific object from upk")]
     Extract {
         upk_path: String,
         path: String,
-        output_dir: Option<String>
+        output_dir: Option<String>,
     },
 
     #[command(about = "Extract all objects from upk")]
     Extractall {
         upk_path: String,
-        output_dir: Option<String>
+        output_dir: Option<String>,
     },
 
     Pack {
-        ron_path: String
+        ron_path: String,
     },
 
     #[command(about = "Create script patch bin")]
@@ -417,7 +417,7 @@ enum Commands {
         struct_name: String,
         function_path: String,
         bytecode_file: String,
-        output_dir: Option<String>
+        output_dir: Option<String>,
     },
 
     #[command(about = "Disassemble UnrealScript bytecode from a UPK function")]
@@ -440,7 +440,7 @@ enum Commands {
         package_name: String,
         object_path: String,
         data_file: String,
-        output_dir: Option<String>
+        output_dir: Option<String>,
     },
 
     #[command(about = "Apply a script patch .bin directly to a UPK file")]
@@ -449,55 +449,182 @@ enum Commands {
         upk_path: String,
         output_path: Option<String>,
     },
+
+    #[command(about = "Create a UE3 Font UPK from a TrueType / OpenType font file")]
+    CreateFont {
+        font_file: String,
+
+        font_name: String,
+
+        #[arg(long, default_value_t = 16.0)]
+        size: f32,
+
+        #[arg(long, default_value_t = 72)]
+        dpi: u32,
+
+        #[arg(long, default_value_t = 512)]
+        tex_width: u32,
+
+        #[arg(long, default_value_t = 512)]
+        tex_height: u32,
+
+        #[arg(long, default_value_t = 1)]
+        x_pad: i32,
+
+        #[arg(long, default_value_t = 1)]
+        y_pad: i32,
+
+        #[arg(long)]
+        chars: Option<String>,
+
+        #[arg(long, default_value_t = 684)]
+        upk_version: i16,
+
+        output_dir: Option<String>,
+    },
 }
 
-fn main() -> Result<()> 
-{
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {        
-        Commands::UpkHeader { path } => { upk_header_cursor(&path)?; },
-        Commands::Elements { ron_path, path } => { 
+    match cli.command {
+        Commands::UpkHeader { path } => {
+            upk_header_cursor(&path)?;
+        }
+        Commands::Elements { ron_path, path } => {
             print_obj_elements(&ron_path, &path)?;
-        },
+        }
         Commands::List { path } => getlist(&path)?,
-        Commands::Names { path, output_path } => { 
+        Commands::Names { path, output_path } => {
             let out = output_path.as_deref().unwrap_or("");
             dump_names(&path, out)?
-        },
-        Commands::Extract { upk_path, path, output_dir } => {
+        }
+        Commands::Extract {
+            upk_path,
+            path,
+            output_dir,
+        } => {
             let out = output_dir.as_deref().unwrap_or("");
             extract_file(&upk_path, &path, out, false)?
-        },
-        Commands::Extractall { upk_path, output_dir } => {
+        }
+        Commands::Extractall {
+            upk_path,
+            output_dir,
+        } => {
             let out = output_dir.as_deref().unwrap_or("");
             extract_file(&upk_path, "", out, true)?
-        },
+        }
         Commands::Pack { .. } => unimplemented!(),
-        Commands::MakeScriptPatch
-            { package_name, struct_name, function_path, bytecode_file, output_dir } => 
-        {
+        Commands::MakeScriptPatch {
+            package_name,
+            struct_name,
+            function_path,
+            bytecode_file,
+            output_dir,
+        } => {
             let out = output_dir.as_deref().unwrap_or("patches");
-            make_script_patch
-                (&package_name, &struct_name, &function_path, &bytecode_file, out)?;
-        },
-        Commands::Disasm { upk_path, function_path, output_dir } => {
+            make_script_patch(
+                &package_name,
+                &struct_name,
+                &function_path,
+                &bytecode_file,
+                out,
+            )?;
+        }
+        Commands::Disasm {
+            upk_path,
+            function_path,
+            output_dir,
+        } => {
             let out = output_dir.as_deref().unwrap_or("output");
             disasm_function_cmd(&upk_path, &function_path, out)?;
         }
-        Commands::Compile { upk_path, asm_file, output_file } => {
+        Commands::Compile {
+            upk_path,
+            asm_file,
+            output_file,
+        } => {
             let out = output_file.as_deref().unwrap_or("output.bin");
             compile_asm(&upk_path, &asm_file, out)?;
         }
-        Commands::MakeObjectPatch { package_name, object_path, data_file, output_dir } => {
+        Commands::MakeObjectPatch {
+            package_name,
+            object_path,
+            data_file,
+            output_dir,
+        } => {
             let out = output_dir.as_deref().unwrap_or("patches");
             make_object_patch(&package_name, &object_path, &data_file, out)?;
         }
-        Commands::ApplyPatch { patch_file, upk_path, output_path } => {
+        Commands::ApplyPatch {
+            patch_file,
+            upk_path,
+            output_path,
+        } => {
             apply_patch_cmd(&patch_file, &upk_path, output_path.as_deref())?;
         }
-
+        Commands::CreateFont {
+            font_file,
+            font_name,
+            size,
+            dpi,
+            tex_width,
+            tex_height,
+            x_pad,
+            y_pad,
+            chars,
+            upk_version,
+            output_dir,
+        } => {
+            let out_dir = output_dir.as_deref().unwrap_or("output");
+            create_font_cmd(
+                &font_file,
+                &font_name,
+                size,
+                dpi,
+                tex_width,
+                tex_height,
+                x_pad,
+                y_pad,
+                chars.as_deref(),
+                upk_version,
+                out_dir,
+            )?;
+        }
     }
 
     Ok(())
+}
+
+fn create_font_cmd(
+    font_file: &str,
+    font_name: &str,
+    size: f32,
+    dpi: u32,
+    tex_width: u32,
+    tex_height: u32,
+    x_pad: i32,
+    y_pad: i32,
+    chars: Option<&str>,
+    upk_version: i16,
+    out_dir: &str,
+) -> std::io::Result<()> {
+    use crate::upkfont::{FontConfig, create_font_upk};
+
+    let cfg = FontConfig {
+        font_path: font_file.to_string(),
+        font_name: font_name.to_string(),
+        size_pt: size,
+        dpi,
+        tex_width,
+        tex_height,
+        x_pad,
+        y_pad,
+        chars: chars.map(|s| s.to_string()),
+        upk_version,
+    };
+
+    std::fs::create_dir_all(out_dir)?;
+    let out_path = Path::new(out_dir).join(format!("{}.upk", font_name));
+    create_font_upk(&cfg, &out_path)
 }
