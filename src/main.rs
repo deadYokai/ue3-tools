@@ -7,9 +7,12 @@ use ron::ser::{PrettyConfig, to_string_pretty};
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Cursor, Read, Result, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+use self::upkfont::create_font_blobs;
+
+mod mod_engine;
 mod scriptcompiler;
 mod scriptdisasm;
 mod scriptpatcher;
@@ -509,10 +512,35 @@ enum Commands {
         #[arg(long)]
         chars: Option<String>,
 
+        #[arg(long)]
+        upk: bool,
+
         #[arg(long, default_value_t = 684)]
         upk_version: i16,
 
         output_dir: Option<String>,
+    },
+    #[command(about = "Create a new mod directory")]
+    ModNew {
+        name: String,
+        #[arg(long, default_value = ".")]
+        out: String,
+    },
+
+    #[command(about = "Extract a UPK export blob into a mod dir")]
+    ModExtract {
+        upk_path: String,
+        obj_name: String,
+        mod_dir: String,
+        #[arg(long)]
+        dir: String,
+    },
+
+    #[command(about = "Pack mod dir into ScriptPatch_*.bin files")]
+    ModPack {
+        mod_dir: String,
+        #[arg(long, default_value = "dist")]
+        out: String,
     },
 }
 
@@ -633,6 +661,7 @@ fn main() -> Result<()> {
             x_pad,
             y_pad,
             chars,
+            upk,
             upk_version,
             output_dir,
         } => {
@@ -647,9 +676,30 @@ fn main() -> Result<()> {
                 x_pad,
                 y_pad,
                 chars.as_deref(),
+                upk,
                 upk_version,
                 out_dir,
             )?;
+        }
+        Commands::ModNew { name, out } => {
+            mod_engine::cmd_new(&name, Path::new(&out))?;
+        }
+        Commands::ModExtract {
+            upk_path,
+            obj_name,
+            mod_dir,
+            dir,
+        } => {
+            mod_engine::cmd_extract(Path::new(&upk_path), &obj_name, Path::new(&mod_dir), &dir)?;
+        }
+        Commands::ModPack { mod_dir, out } => {
+            let mod_path = Path::new(&mod_dir);
+            let dist_path = if Path::new(&out).is_absolute() {
+                PathBuf::from(&out)
+            } else {
+                mod_path.join(&out)
+            };
+            mod_engine::cmd_pack(mod_path, &dist_path)?;
         }
     }
 
@@ -709,6 +759,7 @@ fn create_font_cmd(
     x_pad: i32,
     y_pad: i32,
     chars: Option<&str>,
+    write_upk: bool,
     upk_version: i16,
     out_dir: &str,
 ) -> std::io::Result<()> {
@@ -728,6 +779,12 @@ fn create_font_cmd(
     };
 
     std::fs::create_dir_all(out_dir)?;
-    let out_path = Path::new(out_dir).join(format!("{}.upk", font_name));
-    create_font_upk(&cfg, &out_path)
+    create_font_blobs(&cfg, Path::new(out_dir))?;
+
+    if write_upk {
+        let out_path = Path::new(out_dir).join(format!("{}.upk", font_name));
+        create_font_upk(&cfg, &out_path)?;
+    }
+
+    Ok(())
 }

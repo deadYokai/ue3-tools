@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     io::{BufWriter, Result, Write},
     path::Path,
 };
@@ -49,7 +49,7 @@ impl Default for FontConfig {
     }
 }
 
-struct FChar {
+pub struct FChar {
     start_u: i32,
     start_v: i32,
     u_size: i32,
@@ -972,4 +972,48 @@ fn strip_package_prefix(path: &str, pkg: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+pub fn create_font_blobs(cfg: &FontConfig, out_dir: &Path) -> Result<()> {
+    let r = rasterize(cfg)?;
+    let pkg = &cfg.font_name;
+    let ver = cfg.upk_version;
+
+    let mut nt = build_name_table(pkg, &r.pages, ver);
+    let page_names: Vec<String> = (0..r.pages.len()).map(|i| page_name(pkg, i)).collect();
+    for n in &page_names {
+        nt.add(n);
+    }
+
+    let tex_refs: Vec<i32> = (2..=r.pages.len() as i32 + 1).collect();
+
+    let font_blob = serial_font(
+        &r.fchars, &tex_refs, r.em_scale, r.ascent, r.descent, r.leading, &nt, ver,
+    );
+
+    fs::create_dir_all(out_dir)?;
+
+    let font_path = out_dir.join(format!("{}.Font", pkg));
+    fs::write(&font_path, &font_blob)?;
+    println!(" {} bytes  →  {}", font_blob.len(), font_path.display());
+
+    for (i, page) in r.pages.iter().enumerate() {
+        let tex_blob = serial_texture2d(page, &page_names[i], &nt, ver);
+        let tex_path = out_dir.join(format!("{}.Texture2D", page_names[i]));
+        fs::write(&tex_path, &tex_blob)?;
+        println!(
+            " {} bytes  →  {}  ({}×{})",
+            tex_blob.len(),
+            tex_path.display(),
+            page.width,
+            page.height
+        );
+    }
+
+    println!(
+        "blobs done — {} char(s), {} page(s)",
+        r.fchars.iter().filter(|c| c.u_size > 0).count(),
+        r.pages.len()
+    );
+    Ok(())
 }
