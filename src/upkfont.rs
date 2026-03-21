@@ -1,13 +1,19 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Result, Write};
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufWriter, Result, Write},
+    path::Path,
+};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
+use crate::{
+    scriptpatcher::{LinkerPatchData, PatchData, compress_patch},
+    upkreader::{UPKPak, UpkHeader},
+};
+
 const VER_BYTEPROP_SERIALIZE_ENUM: i16 = 633;
 const VER_PROPERTYTAG_BOOL_OPT: i16 = 673;
-const VER_NO_LAGACY_CMAP: i16 = 543;
 const VER_HAS_GUID_OFFSETS: i16 = 623;
 const VER_HAS_THUMBNAIL: i16 = 584;
 const VER_HAS_EXTRA_PKGS: i16 = 516;
@@ -52,170 +58,102 @@ struct FChar {
     vert_off: i32,
 }
 
-struct TexPage {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+pub struct TexPage {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub struct Raster {
+    pub fchars: Vec<FChar>,
+    pub pages: Vec<TexPage>,
+    pub em_scale: f32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub leading: f32,
 }
 
 pub fn create_font_upk(cfg: &FontConfig, out_path: &Path) -> Result<()> {
-    let Raster {
-        fchars,
-        pages,
-        em_scale,
-        ascent,
-        descent,
-        leading,
-    } = rasterize(cfg)?;
-
-    let ver = cfg.upk_version;
+    let r = rasterize(cfg)?;
     let pkg = &cfg.font_name;
+    let ver = cfg.upk_version;
 
-    let mut nt = NT::new();
+    let mut nt = build_name_table(pkg, &r.pages, ver);
 
-    nt.add("None");
-    nt.add(pkg);
-    nt.add("Font");
-    nt.add("Texture2D");
-    nt.add("Engine");
-    nt.add("Core");
-    nt.add("Class");
-    nt.add("Package");
-
-    nt.add("Characters");
-    nt.add("Textures");
-    nt.add("Kerning");
-    nt.add("IsRemapped");
-    nt.add("EmScale");
-    nt.add("Ascent");
-    nt.add("Descent");
-    nt.add("Leading");
-    nt.add("ScalingFactor");
-
-    nt.add("Format");
-    nt.add("LODGroup");
-    nt.add("NeverStream");
-    nt.add("SRGB");
-    nt.add("CompressionSettings");
-    nt.add("MipGenSettings");
-
-    nt.add("IntProperty");
-    nt.add("FloatProperty");
-    nt.add("BoolProperty");
-    nt.add("ByteProperty");
-    nt.add("ArrayProperty");
-    nt.add("ObjectProperty");
-    nt.add("EPixelFormat");
-    nt.add("TextureGroup");
-    nt.add("TextureCompressionSettings");
-    nt.add("TextureMipGenSettings");
-    nt.add("PF_A8R8G8B8");
-    nt.add("TEXTUREGROUP_UI");
-    nt.add("TC_Displacementmap");
-    nt.add("TMGS_NoMipmaps");
-    let page_names: Vec<String> = (0..pages.len()).map(|i| page_name(pkg, i)).collect();
+    let page_names: Vec<String> = (0..r.pages.len()).map(|i| page_name(pkg, i)).collect();
     for n in &page_names {
         nt.add(n);
     }
+
     let imports = build_imports(&nt);
-    let num_exports = 1 + pages.len();
-    let tex_export_refs: Vec<i32> = (2..=pages.len() as i32 + 1).collect();
+
+    let num_exports = 1 + r.pages.len();
+    let tex_refs: Vec<i32> = (2..=r.pages.len() as i32 + 1).collect();
+
     let font_data = serial_font(
-        &fchars,
-        &tex_export_refs,
-        em_scale,
-        ascent,
-        descent,
-        leading,
-        &nt,
-        ver,
+        &r.fchars, &tex_refs, r.em_scale, r.ascent, r.descent, r.leading, &nt, ver,
     );
-    let tex_data: Vec<Vec<u8>> = pages
+    let tex_data: Vec<Vec<u8>> = r
+        .pages
         .iter()
         .enumerate()
         .map(|(i, p)| serial_texture2d(p, &page_names[i], &nt, ver))
         .collect();
+
     let h = header_binary_size(ver);
     let n = nt.byte_size();
     let e = num_exports * EXPORT_ENTRY_SIZE;
     let imp = imports.len() * IMPORT_ENTRY_SIZE;
     let d = num_exports * 4;
+
     let name_off = h as i32;
     let export_off = (h + n) as i32;
     let import_off = (h + n + e) as i32;
     let depend_off = (h + n + e + imp) as i32;
     let guid_off = (h + n + e + imp + d) as i32;
-    let thumb_off = 0u32;
 
     let serial_start = h + n + e + imp + d;
     let header_size = serial_start as i32;
+
     let font_offset = serial_start as i32;
     let font_size = font_data.len() as i32;
 
-    let mut tex_offsets = Vec::with_capacity(pages.len());
+    let mut tex_offsets = Vec::with_capacity(r.pages.len());
     let mut cur = serial_start + font_data.len();
     for td in &tex_data {
         tex_offsets.push(cur as i32);
         cur += td.len();
     }
+
     let file = File::create(out_path)?;
     let mut w = BufWriter::new(file);
-    w.write_u32::<LittleEndian>(0x9E2A83C1)?;
-    w.write_i16::<LittleEndian>(ver)?;
-    w.write_i16::<LittleEndian>(0)?;
-    w.write_i32::<LittleEndian>(header_size)?;
-    w.write_i32::<LittleEndian>(0)?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.write_i32::<LittleEndian>(nt.names.len() as i32)?;
-    w.write_i32::<LittleEndian>(name_off)?;
-    w.write_i32::<LittleEndian>(num_exports as i32)?;
-    w.write_i32::<LittleEndian>(export_off)?;
-    w.write_i32::<LittleEndian>(imports.len() as i32)?;
-    w.write_i32::<LittleEndian>(import_off)?;
-    w.write_i32::<LittleEndian>(depend_off)?;
-    if ver >= VER_HAS_GUID_OFFSETS {
-        w.write_i32::<LittleEndian>(guid_off)?;
-        w.write_u32::<LittleEndian>(0)?;
-        w.write_u32::<LittleEndian>(0)?;
-    }
-    if ver >= VER_HAS_THUMBNAIL {
-        w.write_u32::<LittleEndian>(thumb_off)?;
-    }
 
-    for seed in [0x12345678u32, 0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE] {
-        w.write_u32::<LittleEndian>(seed)?;
-    }
-
-    w.write_i32::<LittleEndian>(1)?;
-    w.write_i32::<LittleEndian>(num_exports as i32)?;
-    w.write_i32::<LittleEndian>(nt.names.len() as i32)?;
-    w.write_i32::<LittleEndian>(0)?;
-
-    w.write_i32::<LittleEndian>(12791)?;
-    w.write_i32::<LittleEndian>(0)?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.write_i32::<LittleEndian>(0)?;
-
-    if ver >= VER_HAS_EXTRA_PKGS {
-        w.write_i32::<LittleEndian>(0)?;
-    }
-    if ver >= VER_HAS_TEX_ALLOCS {
-        w.write_i32::<LittleEndian>(0)?;
-    }
+    write_upk_header(
+        &mut w,
+        ver,
+        header_size,
+        name_off,
+        export_off,
+        import_off,
+        depend_off,
+        guid_off,
+        nt.names.len(),
+        num_exports,
+        imports.len(),
+    )?;
 
     nt.write(&mut w)?;
 
     write_export(
         &mut w,
         ver,
-        -2, // class = Font import
+        -2,
         0,
         0,
         nt.idx(pkg),
         0,
         0,
-        0x0000_0000_0000_000C, // RF_Public | RF_Standalone
+        0x0000_0000_0000_000C,
         font_size,
         font_offset,
     )?;
@@ -223,13 +161,13 @@ pub fn create_font_upk(cfg: &FontConfig, out_path: &Path) -> Result<()> {
         write_export(
             &mut w,
             ver,
-            -3, // class = Texture2D import
+            -3,
             0,
-            1, // outer = Font export (1-based)
+            1,
             nt.idx(&page_names[i]),
             0,
             0,
-            0x0000_0000_0000_0004, // RF_Public
+            0x0000_0000_0000_0004,
             td.len() as i32,
             tex_offsets[i],
         )?;
@@ -238,7 +176,6 @@ pub fn create_font_upk(cfg: &FontConfig, out_path: &Path) -> Result<()> {
     for imp in &imports {
         imp.write(&mut w)?;
     }
-
     for _ in 0..num_exports {
         w.write_i32::<LittleEndian>(0)?;
     }
@@ -251,19 +188,148 @@ pub fn create_font_upk(cfg: &FontConfig, out_path: &Path) -> Result<()> {
     println!(
         "Wrote font UPK: {}  ({} chars, {} page(s))",
         out_path.display(),
-        fchars.len(),
-        pages.len()
+        r.fchars.len(),
+        r.pages.len()
     );
     Ok(())
 }
+pub fn create_font_patch(
+    upk_raw: &[u8],
+    header: &UpkHeader,
+    pak: &UPKPak,
+    font_object_name: &str,
+    cfg: &FontConfig,
+    out_dir: &Path,
+) -> Result<()> {
+    let ver = header.p_ver;
 
-struct Raster {
-    fchars: Vec<FChar>,
-    pages: Vec<TexPage>,
-    em_scale: f32,
-    ascent: f32,
-    descent: f32,
-    leading: f32,
+    let needle = font_object_name.to_lowercase();
+    let font_exp_idx = pak
+        .export_table
+        .iter()
+        .enumerate()
+        .find(|(i, _)| {
+            let class = pak.get_class_name(pak.export_table[*i].class_index);
+            let name = pak.fname_to_string(&pak.export_table[*i].object_name);
+            class == "Font" && name.to_lowercase() == needle
+        })
+        .map(|(i, _)| i)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No Font export named '{}' found in UPK", font_object_name),
+            )
+        })?;
+
+    let font_exp = &pak.export_table[font_exp_idx];
+    let font_name = pak.fname_to_string(&font_exp.object_name);
+    let font_path_name = pak.get_export_path_name((font_exp_idx + 1) as i32);
+
+    println!(
+        "Found font: {} (export #{})",
+        font_path_name,
+        font_exp_idx + 1
+    );
+
+    let font_1based = (font_exp_idx + 1) as i32;
+    let mut tex_exports: Vec<usize> = pak
+        .export_table
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            e.outer_index == font_1based && pak.get_class_name(e.class_index) == "Texture2D"
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    tex_exports.sort_by_key(|&i| pak.export_table[i].serial_offset);
+
+    println!(
+        "Found {} texture page(s) for '{}'",
+        tex_exports.len(),
+        font_name
+    );
+
+    let r = rasterize(cfg)?;
+
+    if r.pages.len() != tex_exports.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Original font '{}' has {} texture page(s) but the new rasterization \
+                 produced {} page(s). CDO patches cannot add/remove exports.\n\
+                 Hint: adjust --tex-width / --tex-height or --size so the glyph packing \
+                 results in exactly {} page(s).",
+                font_name,
+                tex_exports.len(),
+                r.pages.len(),
+                tex_exports.len(),
+            ),
+        ));
+    }
+
+    let tex_refs: Vec<i32> = tex_exports.iter().map(|&i| (i + 1) as i32).collect();
+
+    let mut nt = build_name_table(&font_name, &r.pages, ver);
+    let page_names: Vec<String> = tex_exports
+        .iter()
+        .map(|&i| pak.fname_to_string(&pak.export_table[i].object_name))
+        .collect();
+    for n in &page_names {
+        nt.add(n);
+    }
+
+    let font_serial = serial_font(
+        &r.fchars, &tex_refs, r.em_scale, r.ascent, r.descent, r.leading, &nt, ver,
+    );
+
+    let pkg_name = {
+        let parts: Vec<&str> = font_path_name.split('.').collect();
+        if parts.len() > 1 {
+            parts[0].to_string()
+        } else {
+            font_path_name.clone()
+        }
+    };
+
+    let mut patch = LinkerPatchData::new(pkg_name.clone());
+
+    let font_inner_path = strip_package_prefix(&font_path_name, &pkg_name);
+    patch.add_cdo_patch(PatchData::new(font_inner_path.clone(), font_serial));
+    println!(
+        "  CDO patch: '{}'  ({} bytes)",
+        font_inner_path,
+        font_serial_len(&r.fchars, tex_refs.len())
+    );
+
+    for (page_idx, &tex_exp_i) in tex_exports.iter().enumerate() {
+        let tex_path = pak.get_export_path_name((tex_exp_i + 1) as i32);
+        let tex_inner = strip_package_prefix(&tex_path, &pkg_name);
+        let page = &r.pages[page_idx];
+        let tex_serial = serial_texture2d(page, &page_names[page_idx], &nt, ver);
+
+        println!(
+            "  CDO patch: '{}'  ({}×{}, {} bytes)",
+            tex_inner,
+            page.width,
+            page.height,
+            tex_serial.len()
+        );
+
+        patch.add_cdo_patch(PatchData::new(tex_inner, tex_serial));
+    }
+
+    std::fs::create_dir_all(out_dir)?;
+    let out_path = out_dir.join(format!("ScriptPatch_{}.bin", pkg_name));
+    let bin = compress_patch(&patch)?;
+    std::fs::write(&out_path, &bin)?;
+
+    println!(
+        "Wrote font patch: {}  ({} CDO patch(es))",
+        out_path.display(),
+        patch.modified_class_default_objects.len()
+    );
+    Ok(())
 }
 
 fn rasterize(cfg: &FontConfig) -> Result<Raster> {
@@ -280,7 +346,7 @@ fn rasterize(cfg: &FontConfig) -> Result<Raster> {
 
     let metrics = face.clone();
     let px_ascend = (metrics.ascender() >> 6) as i32;
-    let px_descend = (metrics.descender() >> 6) as i32;
+    let px_descend = (metrics.descender() >> 6) as i32; // negative
     let px_height = (metrics.height() >> 6) as i32;
 
     let px_em = (px_ascend - px_descend).max(1) as f32;
@@ -343,9 +409,9 @@ fn rasterize(cfg: &FontConfig) -> Result<Raster> {
             for x in 0..bw as usize {
                 let alpha = buf[y * pitch + x];
                 let dst = (y * bw as usize + x) * 4;
-                rgba[dst] = 255;
-                rgba[dst + 1] = 255;
-                rgba[dst + 2] = 255;
+                rgba[dst] = 255; // B (BGRA = PF_A8R8G8B8)
+                rgba[dst + 1] = 255; // G
+                rgba[dst + 2] = 255; // R
                 rgba[dst + 3] = alpha;
             }
         }
@@ -382,19 +448,6 @@ fn rasterize(cfg: &FontConfig) -> Result<Raster> {
     let mut cy: i32 = ypad;
     let mut row_h: i32 = 0;
     let mut max_used_y: i32 = ypad;
-
-    let flush_page = |buf: &Vec<u8>, max_y: i32, tw: i32, tmh: u32| -> TexPage {
-        let actual_h = next_pow2((max_y + 1).max(4) as u32).min(tmh);
-        let copy_h = actual_h as i32;
-        let mut rgba = vec![0u8; (tw * copy_h * 4) as usize];
-        let src_len = ((tw * copy_h * 4) as usize).min(buf.len());
-        rgba[..src_len].copy_from_slice(&buf[..src_len]);
-        TexPage {
-            rgba,
-            width: tw as u32,
-            height: actual_h,
-        }
-    };
 
     for g in &glyphs {
         let slot = g.code as usize;
@@ -441,7 +494,6 @@ fn rasterize(cfg: &FontConfig) -> Result<Raster> {
         }
 
         let vert_off = px_ascend - g.top;
-
         fchars[slot] = FChar {
             start_u: cx,
             start_v: cy,
@@ -466,6 +518,19 @@ fn rasterize(cfg: &FontConfig) -> Result<Raster> {
         descent,
         leading,
     })
+}
+
+fn flush_page(buf: &[u8], max_y: i32, tw: i32, tmh: u32) -> TexPage {
+    let actual_h = next_pow2((max_y + 1).max(4) as u32).min(tmh);
+    let copy_h = actual_h as i32;
+    let n = (tw * copy_h * 4) as usize;
+    let mut rgba = vec![0u8; n];
+    rgba[..n.min(buf.len())].copy_from_slice(&buf[..n.min(buf.len())]);
+    TexPage {
+        rgba,
+        width: tw as u32,
+        height: actual_h,
+    }
 }
 
 fn serial_font(
@@ -493,8 +558,8 @@ fn serial_font(
         buf.write_u8(c.tex_idx).unwrap();
         buf.write_i32::<LittleEndian>(c.vert_off).unwrap();
     }
-    pw.arr_objs(&mut buf, "Textures", tex_refs);
 
+    pw.arr_objs(&mut buf, "Textures", tex_refs);
     pw.int(&mut buf, "Kerning", 0);
     pw.int(&mut buf, "IsRemapped", 0);
     pw.float(&mut buf, "EmScale", em_scale);
@@ -502,7 +567,6 @@ fn serial_font(
     pw.float(&mut buf, "Descent", descent);
     pw.float(&mut buf, "Leading", leading);
     pw.float(&mut buf, "ScalingFactor", 1.0);
-
     pw.none(&mut buf);
 
     buf.write_i32::<LittleEndian>(0).unwrap();
@@ -510,7 +574,15 @@ fn serial_font(
     buf
 }
 
-fn serial_texture2d(page: &TexPage, _name: &str, nt: &NT, ver: i16) -> Vec<u8> {
+fn font_serial_len(chars: &[FChar], tex_count: usize) -> usize {
+    let arr = 4 + chars.len() * 21;
+    let tex = 4 + tex_count * 4;
+    let props = 9 * 24 + 9 * 4;
+    let none = 8;
+    arr + tex + props + none + 4
+}
+
+pub fn serial_texture2d(page: &TexPage, _name: &str, nt: &NT, ver: i16) -> Vec<u8> {
     let mut buf = Vec::new();
     let pw = PW::new(nt, ver);
 
@@ -533,12 +605,12 @@ fn serial_texture2d(page: &TexPage, _name: &str, nt: &NT, ver: i16) -> Vec<u8> {
     pw.none(&mut buf);
 
     let px_bytes = page.rgba.len() as i32;
-    buf.write_i32::<LittleEndian>(1).unwrap();
+    buf.write_i32::<LittleEndian>(1).unwrap(); // NumMips = 1
 
-    buf.write_u32::<LittleEndian>(0).unwrap();
+    buf.write_u32::<LittleEndian>(0).unwrap(); // BulkDataFlags = inline
     buf.write_i32::<LittleEndian>(px_bytes).unwrap();
     buf.write_i32::<LittleEndian>(px_bytes).unwrap();
-    buf.write_i32::<LittleEndian>(-1).unwrap();
+    buf.write_i32::<LittleEndian>(-1).unwrap(); // FileOffset placeholder (inline)
 
     buf.extend_from_slice(&page.rgba);
 
@@ -550,22 +622,22 @@ fn serial_texture2d(page: &TexPage, _name: &str, nt: &NT, ver: i16) -> Vec<u8> {
 
 fn header_binary_size(ver: i16) -> usize {
     let mut s: usize = 0;
-    s += 4 + 2 + 2;
-    s += 4;
-    s += 4;
-    s += 4;
-    s += 4 * 7;
+    s += 4 + 2 + 2; // sign, p_ver, l_ver
+    s += 4; // header_size
+    s += 4; // path_len (= 0)
+    s += 4; // pak_flags
+    s += 4 * 7; // name/export/import/depends counts+offsets
     if ver >= VER_HAS_GUID_OFFSETS {
         s += 4 + 4 + 4;
     }
     if ver >= VER_HAS_THUMBNAIL {
         s += 4;
     }
-    s += 16;
-    s += 4 + 12;
-    s += 4 + 4;
-    s += 4 + 4;
-    s += 4;
+    s += 16; // GUID
+    s += 4 + 12; // gen_count(1) + 1 generation
+    s += 4 + 4; // engine_ver, cooker_ver
+    s += 4 + 4; // compression_method, compressed_chunks_count
+    s += 4; // package_source
     if ver >= VER_HAS_EXTRA_PKGS {
         s += 4;
     }
@@ -576,7 +648,6 @@ fn header_binary_size(ver: i16) -> usize {
 }
 
 const EXPORT_ENTRY_SIZE: usize = 68;
-
 const IMPORT_ENTRY_SIZE: usize = 28;
 
 #[allow(clippy::too_many_arguments)]
@@ -602,15 +673,69 @@ fn write_export<W: Write>(
     w.write_u64::<LittleEndian>(flags)?;
     w.write_i32::<LittleEndian>(ser_size)?;
     w.write_i32::<LittleEndian>(ser_off)?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.write_i32::<LittleEndian>(0)?;
-
+    w.write_u32::<LittleEndian>(0)?; // export_flags
+    w.write_i32::<LittleEndian>(0)?; // generation_net_object_count (count=0)
     for _ in 0..4 {
         w.write_i32::<LittleEndian>(0)?;
-    }
-    w.write_u32::<LittleEndian>(0)?;
-
+    } // package_guid
+    w.write_u32::<LittleEndian>(0)?; // package_flags
     let _ = ver;
+    Ok(())
+}
+
+fn write_upk_header<W: Write>(
+    w: &mut W,
+    ver: i16,
+    header_size: i32,
+    name_off: i32,
+    export_off: i32,
+    import_off: i32,
+    depend_off: i32,
+    guid_off: i32,
+    name_count: usize,
+    exp_count: usize,
+    imp_count: usize,
+) -> Result<()> {
+    w.write_u32::<LittleEndian>(0x9E2A83C1)?;
+    w.write_i16::<LittleEndian>(ver)?;
+    w.write_i16::<LittleEndian>(0)?;
+    w.write_i32::<LittleEndian>(header_size)?;
+    w.write_i32::<LittleEndian>(0)?; // path_len=0
+    w.write_u32::<LittleEndian>(0)?; // pak_flags
+    w.write_i32::<LittleEndian>(name_count as i32)?;
+    w.write_i32::<LittleEndian>(name_off)?;
+    w.write_i32::<LittleEndian>(exp_count as i32)?;
+    w.write_i32::<LittleEndian>(export_off)?;
+    w.write_i32::<LittleEndian>(imp_count as i32)?;
+    w.write_i32::<LittleEndian>(import_off)?;
+    w.write_i32::<LittleEndian>(depend_off)?;
+
+    if ver >= VER_HAS_GUID_OFFSETS {
+        w.write_i32::<LittleEndian>(guid_off)?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.write_u32::<LittleEndian>(0)?;
+    }
+    if ver >= VER_HAS_THUMBNAIL {
+        w.write_u32::<LittleEndian>(0)?;
+    }
+    for seed in [0x12345678u32, 0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE] {
+        w.write_u32::<LittleEndian>(seed)?;
+    }
+    w.write_i32::<LittleEndian>(1)?;
+    w.write_i32::<LittleEndian>(exp_count as i32)?;
+    w.write_i32::<LittleEndian>(name_count as i32)?;
+    w.write_i32::<LittleEndian>(0)?;
+    w.write_i32::<LittleEndian>(12791)?;
+    w.write_i32::<LittleEndian>(0)?;
+    w.write_u32::<LittleEndian>(0)?;
+    w.write_u32::<LittleEndian>(0)?;
+    w.write_i32::<LittleEndian>(0)?;
+    if ver >= VER_HAS_EXTRA_PKGS {
+        w.write_i32::<LittleEndian>(0)?;
+    }
+    if ver >= VER_HAS_TEX_ALLOCS {
+        w.write_i32::<LittleEndian>(0)?;
+    }
     Ok(())
 }
 
@@ -635,28 +760,73 @@ impl ImportEntry {
 }
 
 fn build_imports(nt: &NT) -> Vec<ImportEntry> {
-    let engine_imp = ImportEntry {
-        cls_pkg: (nt.idx("Core"), 0),
-        cls_name: (nt.idx("Package"), 0),
-        outer: 0,
-        obj_name: (nt.idx("Engine"), 0),
-    };
-    let font_imp = ImportEntry {
-        cls_pkg: (nt.idx("Core"), 0),
-        cls_name: (nt.idx("Class"), 0),
-        outer: -1,
-        obj_name: (nt.idx("Font"), 0),
-    };
-    let tex_imp = ImportEntry {
-        cls_pkg: (nt.idx("Core"), 0),
-        cls_name: (nt.idx("Class"), 0),
-        outer: -1,
-        obj_name: (nt.idx("Texture2D"), 0),
-    };
-    vec![engine_imp, font_imp, tex_imp]
+    vec![
+        ImportEntry {
+            cls_pkg: (nt.idx("Core"), 0),
+            cls_name: (nt.idx("Package"), 0),
+            outer: 0,
+            obj_name: (nt.idx("Engine"), 0),
+        },
+        ImportEntry {
+            cls_pkg: (nt.idx("Core"), 0),
+            cls_name: (nt.idx("Class"), 0),
+            outer: -1,
+            obj_name: (nt.idx("Font"), 0),
+        },
+        ImportEntry {
+            cls_pkg: (nt.idx("Core"), 0),
+            cls_name: (nt.idx("Class"), 0),
+            outer: -1,
+            obj_name: (nt.idx("Texture2D"), 0),
+        },
+    ]
 }
-struct NT {
-    names: Vec<String>,
+
+fn build_name_table(pkg: &str, pages: &[TexPage], _ver: i16) -> NT {
+    let mut nt = NT::new();
+    nt.add("None");
+    nt.add(pkg);
+    nt.add("Font");
+    nt.add("Texture2D");
+    nt.add("Engine");
+    nt.add("Core");
+    nt.add("Class");
+    nt.add("Package");
+    nt.add("Characters");
+    nt.add("Textures");
+    nt.add("Kerning");
+    nt.add("IsRemapped");
+    nt.add("EmScale");
+    nt.add("Ascent");
+    nt.add("Descent");
+    nt.add("Leading");
+    nt.add("ScalingFactor");
+    nt.add("Format");
+    nt.add("LODGroup");
+    nt.add("NeverStream");
+    nt.add("SRGB");
+    nt.add("CompressionSettings");
+    nt.add("MipGenSettings");
+    nt.add("IntProperty");
+    nt.add("FloatProperty");
+    nt.add("BoolProperty");
+    nt.add("ByteProperty");
+    nt.add("ArrayProperty");
+    nt.add("ObjectProperty");
+    nt.add("EPixelFormat");
+    nt.add("TextureGroup");
+    nt.add("TextureCompressionSettings");
+    nt.add("TextureMipGenSettings");
+    nt.add("PF_A8R8G8B8");
+    nt.add("TEXTUREGROUP_UI");
+    nt.add("TC_Displacementmap");
+    nt.add("TMGS_NoMipmaps");
+    let _ = pages;
+    nt
+}
+
+pub struct NT {
+    pub names: Vec<String>,
     map: HashMap<String, i32>,
 }
 
@@ -668,7 +838,7 @@ impl NT {
         }
     }
 
-    fn add(&mut self, s: &str) -> i32 {
+    pub fn add(&mut self, s: &str) -> i32 {
         if let Some(&i) = self.map.get(s) {
             return i;
         }
@@ -678,7 +848,7 @@ impl NT {
         i
     }
 
-    fn idx(&self, s: &str) -> i32 {
+    pub fn idx(&self, s: &str) -> i32 {
         *self
             .map
             .get(s)
@@ -691,7 +861,7 @@ impl NT {
             w.write_i32::<LittleEndian>((b.len() + 1) as i32)?;
             w.write_all(b)?;
             w.write_u8(0)?;
-            w.write_u64::<LittleEndian>(0)?; // flags
+            w.write_u64::<LittleEndian>(0)?;
         }
         Ok(())
     }
@@ -700,6 +870,7 @@ impl NT {
         self.names.iter().map(|n| 4 + n.len() + 1 + 8).sum()
     }
 }
+
 struct PW<'a> {
     nt: &'a NT,
     ver: i16,
@@ -791,5 +962,14 @@ fn page_name(pkg: &str, idx: usize) -> String {
             (b'A' + (idx / 26) as u8) as char,
             (b'A' + (idx % 26) as u8) as char
         )
+    }
+}
+
+fn strip_package_prefix(path: &str, pkg: &str) -> String {
+    let prefix = format!("{}.", pkg);
+    if path.starts_with(&prefix) {
+        path[prefix.len()..].to_string()
+    } else {
+        path.to_string()
     }
 }

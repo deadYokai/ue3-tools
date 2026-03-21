@@ -450,6 +450,38 @@ enum Commands {
         output_path: Option<String>,
     },
 
+    #[command(about = "Create a font CDO patch .bin targeting a font inside an existing UPK")]
+    MakeFontPatch {
+        upk_path: String,
+
+        font_object_name: String,
+
+        font_file: String,
+
+        #[arg(long, default_value_t = 16.0)]
+        size: f32,
+
+        #[arg(long, default_value_t = 72)]
+        dpi: u32,
+
+        #[arg(long, default_value_t = 512)]
+        tex_width: u32,
+
+        #[arg(long, default_value_t = 512)]
+        tex_height: u32,
+
+        #[arg(long, default_value_t = 1)]
+        x_pad: i32,
+
+        #[arg(long, default_value_t = 1)]
+        y_pad: i32,
+
+        #[arg(long)]
+        chars: Option<String>,
+
+        output_dir: Option<String>,
+    },
+
     #[command(about = "Create a UE3 Font UPK from a TrueType / OpenType font file")]
     CreateFont {
         font_file: String,
@@ -563,6 +595,34 @@ fn main() -> Result<()> {
         } => {
             apply_patch_cmd(&patch_file, &upk_path, output_path.as_deref())?;
         }
+        Commands::MakeFontPatch {
+            upk_path,
+            font_object_name,
+            font_file,
+            size,
+            dpi,
+            tex_width,
+            tex_height,
+            x_pad,
+            y_pad,
+            chars,
+            output_dir,
+        } => {
+            let out = output_dir.as_deref().unwrap_or("patches");
+            make_font_patch_cmd(
+                &upk_path,
+                &font_object_name,
+                &font_file,
+                size,
+                dpi,
+                tex_width,
+                tex_height,
+                x_pad,
+                y_pad,
+                chars.as_deref(),
+                out,
+            )?;
+        }
         Commands::CreateFont {
             font_file,
             font_name,
@@ -594,6 +654,49 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn make_font_patch_cmd(
+    upk_path: &str,
+    font_object_name: &str,
+    font_file: &str,
+    size: f32,
+    dpi: u32,
+    tex_width: u32,
+    tex_height: u32,
+    x_pad: i32,
+    y_pad: i32,
+    chars: Option<&str>,
+    out_dir: &str,
+) -> Result<()> {
+    use crate::upkfont::{FontConfig, create_font_patch};
+
+    let (cursor, header) = upk_header_cursor(upk_path)?;
+    let upk_raw = cursor.into_inner();
+    let mut cur: Cursor<&Vec<u8>> = Cursor::new(&upk_raw);
+    let pak = UPKPak::parse_upk(&mut cur, &header)?;
+
+    let cfg = FontConfig {
+        font_path: font_file.to_string(),
+        font_name: font_object_name.to_string(),
+        size_pt: size,
+        dpi,
+        tex_width,
+        tex_height,
+        x_pad,
+        y_pad,
+        chars: chars.map(|s| s.to_string()),
+        upk_version: header.p_ver,
+    };
+
+    create_font_patch(
+        &upk_raw,
+        &header,
+        &pak,
+        font_object_name,
+        &cfg,
+        Path::new(out_dir),
+    )
 }
 
 fn create_font_cmd(
