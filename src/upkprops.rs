@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::{Cursor, Read, Result, Seek, SeekFrom, Write}};
+use std::io::{Cursor, Read, Result, Seek, SeekFrom, Write};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};

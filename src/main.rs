@@ -276,7 +276,7 @@ fn disasm_function_cmd(upk_path: &str, function_path: &str, output_dir: &str) ->
 
 fn compile_asm(upk_path: &str, asm_file: &str, output_file: &str) -> Result<()> {
     let text = fs::read_to_string(asm_file)?;
-    let (mut cursor, header) = upk_header_cursor(upk_path)?;
+    let (cursor, header) = upk_header_cursor(upk_path)?;
     let mut cur = Cursor::new(cursor.get_ref());
     let pak = UPKPak::parse_upk(&mut cur, &header)?;
     let mut compiler = scriptcompiler::Compiler::new(&pak);

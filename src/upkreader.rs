@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, fs::File, io::{BufWriter, Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::{Path, PathBuf}};
+use std::{collections::HashMap, fmt, fs::File, io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::{Path, PathBuf}};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{to_string_pretty, PrettyConfig};

@@ -6,7 +6,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use std::{
     collections::HashMap,
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
 };
 
 pub fn write_ue3_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
