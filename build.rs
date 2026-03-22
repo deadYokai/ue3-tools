@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{env, fs, path::{Path, PathBuf}, process::Command};
 
 fn probe(cmd: &str) -> bool {
     Command::new(cmd)
@@ -10,33 +10,27 @@ fn probe(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn copy_dll_to_bin_dir(dll: &PathBuf, out_dir: &PathBuf) {
+fn copy_dll_to_bin_dir(dll: &Path, out_dir: &Path) {
     let Some(bin_dir) = out_dir.ancestors().nth(3) else {
         eprintln!("cargo:warning=Could not determine bin dir from OUT_DIR");
         return;
     };
     let dst = bin_dir.join("dinput8.dll");
     match fs::copy(dll, &dst) {
-        Ok(_) => eprintln!("cargo:warning=dinput8.dll -> {}", dst.display()),
+        Ok(_)  => eprintln!("cargo:warning=dinput8.dll -> {}", dst.display()),
         Err(e) => eprintln!("cargo:warning=Failed to copy dinput8.dll: {e}"),
     }
 }
 
-fn build_mingw(cc: &str, sources: &[PathBuf], def: &PathBuf, dll_out: &PathBuf, out_dir: &PathBuf) {
+fn build_mingw(cc: &str, sources: &[PathBuf], def: &Path,
+               include: &Path, dll_out: &Path, out_dir: &Path) {
     let mut cmd = Command::new(cc);
     cmd.args(["-std=c++17", "-shared", "-O2"])
-        .arg("-o")
-        .arg(dll_out)
-        .args(sources)
-        .arg(def)
-        .args([
-            "-lz",
-            "-static-libgcc",
-            "-static-libstdc++",
-            "-Wl,--kill-at",
-        ])
-        .arg("-I")
-        .arg("wrapper/src");
+       .arg("-o").arg(dll_out)
+       .args(sources)
+       .arg(def)
+       .args(["-Wl,-Bstatic,-lz,-Bdynamic","-static-libgcc","-static-libstdc++","-Wl,--kill-at"])
+       .arg("-I").arg(include);
 
     eprintln!("cargo:warning=Building dinput8.dll with {cc}");
     match cmd.status() {
@@ -49,17 +43,16 @@ fn build_mingw(cc: &str, sources: &[PathBuf], def: &PathBuf, dll_out: &PathBuf, 
     }
 }
 
-fn build_msvc(sources: &[PathBuf], def: &PathBuf, dll_out: &PathBuf, out_dir: &PathBuf) {
-    // cl.exe must be on PATH (run from a Developer Command Prompt or vcvarsall.bat)
+fn build_msvc(sources: &[PathBuf], def: &Path,
+              include: &Path, dll_out: &Path, out_dir: &Path) {
     let mut cmd = Command::new("cl");
     cmd.args(["/nologo", "/LD", "/MD", "/std:c++17", "/EHsc", "/O2"])
-        .arg(format!("/Fe:{}", dll_out.display()))
-        .arg("/I")
-        .arg("wrapper/src")
-        .args(sources)
-        .arg("/link")
-        .arg(format!("/DEF:{}", def.display()))
-        .args(["zlib.lib", "/NODEFAULTLIB:LIBCMT"]);
+       .arg(format!("/Fe:{}", dll_out.display()))
+       .arg("/I").arg(include)
+       .args(sources)
+       .arg("/link")
+       .arg(format!("/DEF:{}", def.display()))
+       .args(["zlibstatic.lib", "/NODEFAULTLIB:LIBCMT"]);
 
     eprintln!("cargo:warning=Building dinput8.dll with cl.exe (MSVC)");
     match cmd.status() {
@@ -73,11 +66,12 @@ fn build_msvc(sources: &[PathBuf], def: &PathBuf, dll_out: &PathBuf, out_dir: &P
 }
 
 fn main() {
-    let host = env::var("HOST").unwrap_or_default();
+    let host    = env::var("HOST").unwrap_or_default();
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let wrapper_src = PathBuf::from("wrapper/src");
-    let def_file = PathBuf::from("wrapper/dinput8.def");
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let wrapper_src = manifest.join("wrapper").join("src");
+    let def_file    = manifest.join("wrapper").join("dinput8.def");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", def_file.display());
@@ -90,13 +84,14 @@ fn main() {
             .inspect(|p| println!("cargo:rerun-if-changed={}", p.display()))
             .collect(),
         Err(e) => {
-            eprintln!("cargo:warning=Cannot read wrapper/src: {e}");
+            eprintln!("cargo:warning=Cannot read {}: {e}", wrapper_src.display());
             return;
         }
     };
 
     if sources.is_empty() {
-        eprintln!("cargo:warning=No .cpp sources found, skipping DLL build");
+        eprintln!("cargo:warning=No .cpp sources found in {}, skipping DLL build",
+                  wrapper_src.display());
         return;
     }
 
@@ -104,28 +99,23 @@ fn main() {
 
     if host.contains("linux") {
         let cc = ["x86_64-w64-mingw32-g++", "i686-w64-mingw32-g++"]
-            .iter()
-            .copied()
+            .iter().copied()
             .find(|&c| probe(c));
         match cc {
-            Some(c) => build_mingw(c, &sources, &def_file, &dll_out, &out_dir),
-            None => {
-                eprintln!("cargo:warning=mingw not found — install mingw-w64 to build dinput8.dll")
-            }
+            Some(c) => build_mingw(c, &sources, &def_file, &wrapper_src, &dll_out, &out_dir),
+            None    => eprintln!(
+                "cargo:warning=mingw not found — install mingw-w64 to build dinput8.dll"
+            ),
         }
     } else if host.contains("windows") {
         if probe("cl") {
-            build_msvc(&sources, &def_file, &dll_out, &out_dir);
+            build_msvc(&sources, &def_file, &wrapper_src, &dll_out, &out_dir);
         } else if probe("x86_64-w64-mingw32-g++") {
-            build_mingw(
-                "x86_64-w64-mingw32-g++",
-                &sources,
-                &def_file,
-                &dll_out,
-                &out_dir,
-            );
+            build_mingw("x86_64-w64-mingw32-g++", &sources, &def_file,
+                        &wrapper_src, &dll_out, &out_dir);
         } else if probe("g++") {
-            build_mingw("g++", &sources, &def_file, &dll_out, &out_dir);
+            build_mingw("g++", &sources, &def_file,
+                        &wrapper_src, &dll_out, &out_dir);
         } else {
             eprintln!("cargo:warning=No C++ compiler found on Windows, skipping DLL build");
         }

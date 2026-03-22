@@ -3,6 +3,7 @@
 #include "log.hpp"
 #include "overlay.hpp"
 #include "util.hpp"
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <windows.h>

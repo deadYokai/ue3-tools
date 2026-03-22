@@ -2,6 +2,7 @@
 #include "hook.hpp"
 #include "log.hpp"
 #include "util.hpp"
+#include <unknwn.h>
 #include <windows.h>
 
 static volatile FARPROC g_real_di8 = nullptr;
