@@ -30,6 +30,12 @@ std::pair<std::string, std::string> split_kv(const std::string &line) {
 	return {trim(line.substr(0, eq)), strip_quotes(trim(line.substr(eq + 1)))};
 }
 
+std::string to_lower(std::string s) {
+	for (auto &c : s)
+		c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	return s;
+}
+
 } // namespace
 
 std::vector<ObjectReplacement> parse(const std::string &text,
@@ -48,42 +54,45 @@ std::vector<ObjectReplacement> parse(const std::string &text,
 			return;
 		}
 
-		auto dot = cur_orig.rfind('.');
+		auto orig_dot = cur_orig.rfind('.');
 		std::string obj_name =
-		    (dot != std::string::npos) ? cur_orig.substr(dot + 1) : cur_orig;
+		    (orig_dot != std::string::npos) ? cur_orig.substr(orig_dot + 1)
+		                                    : cur_orig;
 
-		auto rdot = cur_repl.rfind('.');
-		std::string repl_pkg =
-		    (rdot != std::string::npos) ? cur_repl.substr(0, rdot) : cur_repl;
-		std::string repl_pkg_lo = repl_pkg;
-		for (auto &c : repl_pkg_lo)
-			c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+		std::string repl_full = cur_repl;
+		auto repl_dot = cur_repl.rfind('.');
+		if (repl_dot == std::string::npos) {
+			repl_full = cur_repl + "." + cur_repl;
+		}
 
-		std::wstring upk_path;
+		auto pkg_dot = repl_full.rfind('.');
+		std::string repl_pkg = repl_full.substr(0, pkg_dot);
+		std::string repl_pkg_lo = to_lower(repl_pkg);
+
+		std::wstring file_path;
+		std::string  ue3_class;
 		try {
 			for (const auto &e : fs::directory_iterator(mod_dir)) {
 				if (!e.is_regular_file())
 					continue;
+				std::string stem = to_lower(e.path().stem().string());
+				if (stem != repl_pkg_lo)
+					continue;
+
 				std::string ext = e.path().extension().string();
-				std::string stem = e.path().stem().string();
-				for (auto &c : ext)
-					c = static_cast<char>(
-					    tolower(static_cast<unsigned char>(c)));
-				for (auto &c : stem)
-					c = static_cast<char>(
-					    tolower(static_cast<unsigned char>(c)));
-				if (ext == ".upk" && stem == repl_pkg_lo) {
-					upk_path = e.path().wstring();
-					break;
-				}
+				file_path = e.path().wstring();
+				if (ext.size() > 1 && ext[0] == '.' && ext != ".upk")
+					ue3_class = ext.substr(1);
+				break;
 			}
 		} catch (...) {
 		}
 
 		ObjectReplacement r;
-		r.orig_obj = obj_name;
-		r.repl_path_w = to_wide(cur_repl);
-		r.mod_upk_w = upk_path;
+		r.orig_obj    = obj_name;
+		r.repl_path_w = to_wide(repl_full);
+		r.mod_upk_w   = file_path;
+		r.ue3_class   = ue3_class;
 		out.push_back(std::move(r));
 		cur_orig.clear();
 		cur_repl.clear();

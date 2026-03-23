@@ -1,9 +1,9 @@
 #pragma once
+#include "pattern_scanner.hpp"
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <windows.h>
-#include "pattern_scanner.hpp"
 
 struct FName {
 	int32_t Index = 0;
@@ -70,10 +70,9 @@ using FindPackageFile_fn = int(__fastcall *)(void *, const wchar_t *, void *,
 #define PATTERN_StaticLoadObject                                               \
 	"48 8B C4 4C 89 48 20 48 89 50 10 48 89 48 08 53 56 57 48 81 EC F0 00"
 
-// GPackageFileCache ref inside GetPackageLinker @ 0x1401024ff:
-//   48 8B 05 D2 D3 61 01  (MOV RAX, [RIP+0x161D3D2])
-// variable = instruction + 7 + *(int32_t*)(instruction + 3)
-#define PATTERN_GPackageFileCache_Ref "48 8B 05 D2 D3 61 01"
+#define PATTERN_GetPackageLinker                                               \
+	"40 53 56 57 41 54 41 55 41 56 41 57 48 81 ec d0 02 00 00 48 c7 84 24 b8 " \
+	"00 00 00 fe ff ff ff 48 8b 05 ?? ?? ?? ??"
 
 struct UE3Addrs {
 	FNameInit_fn FNameInit = nullptr;
@@ -97,11 +96,26 @@ inline bool ue3_resolve(UE3Addrs &out) {
 	out.StaticLoadObject = reinterpret_cast<StaticLoadObject_fn>(
 	    FindPatternString(exe, PATTERN_StaticLoadObject));
 
-	auto *ref = static_cast<uint8_t *>(
-	    FindPatternString(exe, PATTERN_GPackageFileCache_Ref));
-	if (ref) {
-		int32_t disp = *reinterpret_cast<int32_t *>(ref + 3);
-		out.GPackageFileCache = reinterpret_cast<void **>(ref + 7 + disp);
+	{
+		auto *gplinker = static_cast<uint8_t *>(
+		    FindPatternString(exe, PATTERN_GetPackageLinker));
+
+		if (gplinker) {
+			constexpr size_t kScanWindow = 0x300;
+			uint8_t *mov = nullptr;
+			for (size_t i = 0; i + 7 <= kScanWindow; ++i) {
+				if (gplinker[i] == 0x48 && gplinker[i + 1] == 0x8B &&
+				    gplinker[i + 2] == 0x0D) { // MOV RCX,[RIP+disp32]
+					mov = gplinker + i;
+					break;
+				}
+			}
+			if (mov) {
+				int32_t disp = *reinterpret_cast<int32_t *>(mov + 3);
+				out.GPackageFileCache =
+				    reinterpret_cast<void **>(mov + 7 + disp);
+			}
+		}
 	}
 
 	return out.FNameInit && out.StaticFindObjectFast && out.StaticLoadObject &&

@@ -7,6 +7,7 @@ struct ObjectReplacement {
 	std::string orig_obj;
 	std::wstring repl_path_w;
 	std::wstring mod_upk_w;
+	std::string ue3_class;
 	FName orig_name{};
 	void *cached_obj{};
 };

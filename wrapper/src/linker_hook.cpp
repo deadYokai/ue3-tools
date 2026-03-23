@@ -13,14 +13,9 @@ TrampolineHook Hook_StaticFindObjectFast{};
 void *__fastcall Hooked_StaticFindObjectFast(void *cls, void *outer, FName name,
                                              int bExact, int bAny,
                                              uint64_t excl) {
-	log_info(
-	    "SFOF: Index=%d Number=%d cls=%p outer=%p bExact=%d bAny=%d excl=%llu",
-	    name.Index, name.Number, cls, outer, bExact, bAny,
-	    static_cast<unsigned long long>(excl));
 
 	void *repl = mod_loader::find_replacement(name);
 	if (repl) {
-		log_info("SFOF: -> mod replacement %p", repl);
 		return repl;
 	}
 
@@ -28,7 +23,6 @@ void *__fastcall Hooked_StaticFindObjectFast(void *cls, void *outer, FName name,
 	    Hook_StaticFindObjectFast.trampoline)(cls, outer, name, bExact, bAny,
 	                                          excl);
 
-	log_info("SFOF: -> original result %p", result);
 	return result;
 }
 
@@ -38,7 +32,28 @@ namespace {
 static FindPackageFile_fn g_orig_fpf = nullptr;
 static void **g_fpf_slot = nullptr;
 
-static constexpr int kFPFSlot = 3;
+static constexpr int kFPFSlot = 2;
+
+static bool is_readable(const void *addr, size_t size = sizeof(void *)) {
+	if (!addr)
+		return false;
+	MEMORY_BASIC_INFORMATION mbi{};
+	if (!VirtualQuery(addr, &mbi, sizeof(mbi)))
+		return false;
+	if (mbi.State != MEM_COMMIT)
+		return false;
+	if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+		return false;
+	constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE |
+	                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+	                            PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY;
+	if (!(mbi.Protect & kReadable))
+		return false;
+	const auto region_end =
+	    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+	const auto range_end = reinterpret_cast<uintptr_t>(addr) + size;
+	return range_end <= region_end;
+}
 
 static int __fastcall hook_fpf(void *self, const wchar_t *name, void *guid,
                                FStringLayout *out_fstr,
@@ -72,22 +87,42 @@ static bool vtable_write(void **slot, void *fn) {
 
 void install_vtable() {
 	void **cache = ue3().GPackageFileCache;
+
+	log_info("linker_hook: GPackageFileCache var addr = %p", cache);
+
 	if (!cache || !*cache) {
 		log_warn(
 		    "linker_hook: GPackageFileCache not ready — vtable hook skipped");
 		return;
 	}
 
+	void *obj = *cache;
+	log_info("linker_hook: GPackageFileCache object = %p", obj);
+
+	if (!is_readable(obj, sizeof(void *))) {
+		log_err("linker_hook: object ptr %p is not readable committed memory — "
+		        "PATTERN_GPackageFileCache_Ref matched the wrong instruction; "
+		        "update the pattern or the RIP displacement",
+		        obj);
+		return;
+	}
+
 	auto **vtbl = *reinterpret_cast<void ***>(*cache);
-	if (!vtbl) {
-		log_err("linker_hook: null vtable on GPackageFileCache object");
+	log_info("linker_hook: vtbl = %p", vtbl);
+
+	if (!is_readable(vtbl, sizeof(void *) * (kFPFSlot + 1))) {
+		log_err("linker_hook: vtbl %p is not readable — "
+		        "object at %p does not look like a FPackageFileCache",
+		        vtbl, obj);
 		return;
 	}
 
 	HMODULE exe = GetModuleHandleW(nullptr);
+	log_info("exe module handle: %p", exe);
 	MODULEINFO mi{};
 	GetModuleInformation(GetCurrentProcess(), exe, &mi, sizeof(mi));
-
+	log_info("Base: %p, Size: %lu, Entry: %p", mi.lpBaseOfDll,
+	         (unsigned long)mi.SizeOfImage, mi.EntryPoint);
 	constexpr int kFallback = kFPFSlot; // = 3
 	const int slot = find_fpf_vtable_slot(
 	    vtbl, 16, reinterpret_cast<uintptr_t>(mi.lpBaseOfDll),
