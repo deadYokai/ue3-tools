@@ -200,10 +200,14 @@ fn make_script_patch(
         function_path.to_string(),
         bytecode,
     ));
-    let bin = compress_patch(&patch)?;
+    let (bin, unc) = compress_patch(&patch)?;
     fs::create_dir_all(output_dir)?;
     let out = Path::new(output_dir).join(format!("ScriptPatch_{}.bin", package_name));
     fs::write(&out, &bin)?;
+    fs::write(
+        format!("{}.uncompressed_size", out.display()),
+        format!("{}", unc),
+    )?;
     println!("Wrote patch: {}", out.display());
     Ok(())
 }
@@ -297,10 +301,14 @@ fn make_object_patch(
     let data = fs::read(data_file)?;
     let mut patch = LinkerPatchData::new(package_name.to_string());
     patch.add_cdo_patch(PatchData::new(object_path.to_string(), data));
-    let bin = compress_patch(&patch)?;
+    let (bin, unc) = compress_patch(&patch)?;
     fs::create_dir_all(output_dir)?;
     let out = Path::new(output_dir).join(format!("ScriptPatch_{}.bin", package_name));
     fs::write(&out, &bin)?;
+    fs::write(
+        format!("{}.uncompressed_size", out.display()),
+        format!("{}", unc),
+    )?;
     println!("Wrote CDO patch: {}", out.display());
     Ok(())
 }
@@ -726,6 +734,11 @@ fn make_font_patch_cmd(
     let mut cur: Cursor<&Vec<u8>> = Cursor::new(&upk_raw);
     let pak = UPKPak::parse_upk(&mut cur, &header)?;
 
+    let package_name = Path::new(upk_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Unknown");
+
     let cfg = FontConfig {
         font_path: font_file.to_string(),
         font_name: font_object_name.to_string(),
@@ -745,6 +758,7 @@ fn make_font_patch_cmd(
         &pak,
         font_object_name,
         &cfg,
+        package_name,
         Path::new(out_dir),
     )
 }

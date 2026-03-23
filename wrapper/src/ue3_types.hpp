@@ -1,0 +1,161 @@
+#pragma once
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <windows.h>
+#include "pattern_scanner.hpp"
+
+struct FName {
+	int32_t Index = 0;
+	int32_t Number = 0;
+};
+static_assert(sizeof(FName) == 8);
+
+template <typename T> struct TArrayView {
+	T *Data = nullptr;
+	int32_t Num = 0;
+	int32_t Max = 0;
+
+	T &operator[](int i) { return Data[i]; }
+	const T &operator[](int i) const { return Data[i]; }
+	bool valid() const { return Data != nullptr && Num > 0; }
+};
+
+struct FStringLayout {
+	wchar_t *Data = nullptr;
+	int32_t Num = 0;
+	int32_t Max = 0;
+};
+static_assert(sizeof(FStringLayout) == 16);
+
+namespace LinkerOff {
+static constexpr ptrdiff_t LinkerRoot = 0x005c;
+static constexpr ptrdiff_t NameMap = 0x011c;
+static constexpr ptrdiff_t Filename = 0x01a4;
+static constexpr ptrdiff_t LoadFlags = 0x0250;
+static constexpr ptrdiff_t Loader = 0x0668;
+static constexpr ptrdiff_t FirstPatchFlag = 0x0698;
+static constexpr int NumPatchFlags = 6;
+static constexpr int LoadFlagQuiet = 0x2001;
+} // namespace LinkerOff
+
+namespace UObjectOff {
+static constexpr ptrdiff_t Outer = 0x003c;
+static constexpr ptrdiff_t ObjectName = 0x0044;
+static constexpr ptrdiff_t Class = 0x004c;
+} // namespace UObjectOff
+
+using FNameInit_fn = void (*)(FName *, const wchar_t *, int32_t, int32_t,
+                              int32_t);
+
+using StaticFindObjectFast_fn = void *(__fastcall *)(void *, void *, FName, int,
+                                                     int, uint64_t);
+
+using StaticLoadObject_fn = void *(__fastcall *)(void *, void *,
+                                                 const wchar_t *,
+                                                 const wchar_t *, uint32_t,
+                                                 void *, int);
+
+using FindPackageFile_fn = int(__fastcall *)(void *, const wchar_t *, void *,
+                                             FStringLayout *, const wchar_t *);
+
+// FNameInit @ 0x14005fcf0
+#define PATTERN_FNameInit "40 55 56 57 41 56 48 81 EC C8 0C 00 00"
+
+// UObject::StaticFindObjectFast @ 0x140091dd0
+#define PATTERN_StaticFindObjectFast                                           \
+	"48 89 5C 24 08 48 89 74 24 10 4C 89 44 24 18 57 48 83 EC 30 83 3D"
+
+// UObject::StaticLoadObject @ 0x14010e0a0
+#define PATTERN_StaticLoadObject                                               \
+	"48 8B C4 4C 89 48 20 48 89 50 10 48 89 48 08 53 56 57 48 81 EC F0 00"
+
+// GPackageFileCache ref inside GetPackageLinker @ 0x1401024ff:
+//   48 8B 05 D2 D3 61 01  (MOV RAX, [RIP+0x161D3D2])
+// variable = instruction + 7 + *(int32_t*)(instruction + 3)
+#define PATTERN_GPackageFileCache_Ref "48 8B 05 D2 D3 61 01"
+
+struct UE3Addrs {
+	FNameInit_fn FNameInit = nullptr;
+	StaticFindObjectFast_fn StaticFindObjectFast = nullptr;
+	StaticLoadObject_fn StaticLoadObject = nullptr;
+	void **GPackageFileCache = nullptr;
+};
+
+extern UE3Addrs g_ue3;
+inline UE3Addrs &ue3() { return g_ue3; }
+
+inline bool ue3_resolve(UE3Addrs &out) {
+	HMODULE exe = GetModuleHandleW(nullptr);
+
+	out.FNameInit = reinterpret_cast<FNameInit_fn>(
+	    FindPatternString(exe, PATTERN_FNameInit));
+
+	out.StaticFindObjectFast = reinterpret_cast<StaticFindObjectFast_fn>(
+	    FindPatternString(exe, PATTERN_StaticFindObjectFast));
+
+	out.StaticLoadObject = reinterpret_cast<StaticLoadObject_fn>(
+	    FindPatternString(exe, PATTERN_StaticLoadObject));
+
+	auto *ref = static_cast<uint8_t *>(
+	    FindPatternString(exe, PATTERN_GPackageFileCache_Ref));
+	if (ref) {
+		int32_t disp = *reinterpret_cast<int32_t *>(ref + 3);
+		out.GPackageFileCache = reinterpret_cast<void **>(ref + 7 + disp);
+	}
+
+	return out.FNameInit && out.StaticFindObjectFast && out.StaticLoadObject &&
+	       out.GPackageFileCache;
+}
+
+inline FName fname_find(const wchar_t *str) {
+	FName out{};
+	if (ue3().FNameInit)
+		ue3().FNameInit(&out, str, 0, 0, 0);
+	return out;
+}
+
+inline FName fname_create(const wchar_t *str) {
+	FName out{};
+	if (ue3().FNameInit)
+		ue3().FNameInit(&out, str, 0, 1, 0);
+	return out;
+}
+
+inline TArrayView<FName> linker_namemap(void *linker) {
+	auto *b = static_cast<uint8_t *>(linker);
+	TArrayView<FName> v;
+	memcpy(&v.Data, b + LinkerOff::NameMap, 8);
+	memcpy(&v.Num, b + LinkerOff::NameMap + 8, 4);
+	return v;
+}
+
+inline std::string linker_pkg_stem(void *linker) {
+	auto *b = static_cast<uint8_t *>(linker);
+	wchar_t *wptr = nullptr;
+	int32_t wnum = 0;
+	memcpy(&wptr, b + LinkerOff::Filename, 8);
+	memcpy(&wnum, b + LinkerOff::Filename + 8, 4);
+	if (!wptr || wnum <= 1)
+		return {};
+	std::wstring ws(wptr, wptr + (wnum - 1));
+	auto slash = ws.find_last_of(L"\\/");
+	if (slash != std::wstring::npos)
+		ws = ws.substr(slash + 1);
+	auto dot = ws.rfind(L'.');
+	if (dot != std::wstring::npos)
+		ws.resize(dot);
+	std::string out;
+	out.reserve(ws.size());
+	for (wchar_t c : ws)
+		out += static_cast<char>(towlower(c));
+	return out;
+}
+
+inline void linker_set_all_patch_flags(void *linker) {
+	auto *b = static_cast<uint8_t *>(linker);
+	for (int i = 0; i < LinkerOff::NumPatchFlags; ++i) {
+		int32_t one = 1;
+		memcpy(b + LinkerOff::FirstPatchFlag + i * 4, &one, 4);
+	}
+}

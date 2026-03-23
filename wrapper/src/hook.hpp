@@ -1,15 +1,21 @@
 #pragma once
-#define WIN32_LEAN_AND_MEAN
+#include "pattern_scanner.hpp"
+#include "trampoline_hook.hpp"
 #include <windows.h>
 
-namespace hook {
-void install_create_file_hook();
-void remove_create_file_hook();
+struct PatternHookEntry {
+	const char *name;
+	const char *pattern;
+	TrampolineHook *hook;
+	void *detour;
+};
 
-HANDLE WINAPI real_create_file_w(LPCWSTR lpFileName, DWORD dwDesiredAccess,
-                                 DWORD dwShareMode,
-                                 LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-                                 DWORD dwCreationDisposition,
-                                 DWORD dwFlagsAndAttributes,
-                                 HANDLE hTemplateFile);
+#define HOOK(X)                                                                \
+	PatternHookEntry {                                                         \
+		#X, PATTERN_##X, &Hook_##X, reinterpret_cast<void *>(&Hooked_##X)      \
+	}
+
+namespace hook {
+void install_all();
+void remove_all();
 } // namespace hook

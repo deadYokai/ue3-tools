@@ -1,4 +1,8 @@
-use std::{env, fs, path::{Path, PathBuf}, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn probe(cmd: &str) -> bool {
     Command::new(cmd)
@@ -17,109 +21,159 @@ fn copy_dll_to_bin_dir(dll: &Path, out_dir: &Path) {
     };
     let dst = bin_dir.join("dinput8.dll");
     match fs::copy(dll, &dst) {
-        Ok(_)  => eprintln!("cargo:warning=dinput8.dll -> {}", dst.display()),
+        Ok(_) => eprintln!("cargo:warning=dinput8.dll -> {}", dst.display()),
         Err(e) => eprintln!("cargo:warning=Failed to copy dinput8.dll: {e}"),
     }
 }
 
-fn build_mingw(cc: &str, sources: &[PathBuf], def: &Path,
-               include: &Path, dll_out: &Path, out_dir: &Path) {
-    let mut cmd = Command::new(cc);
-    cmd.args(["-std=c++17", "-shared", "-O2"])
-       .arg("-o").arg(dll_out)
-       .args(sources)
-       .arg(def)
-       .args(["-Wl,-Bstatic,-lz,-Bdynamic","-static-libgcc","-static-libstdc++","-Wl,--kill-at"])
-       .arg("-I").arg(include);
+fn build_cmake(
+    wrapper_dir: &Path,
+    out_dir: &Path,
+    toolchain_file: Option<&Path>,
+) -> Option<PathBuf> {
+    let build_dir = out_dir.join("cmake_build");
+    fs::create_dir_all(&build_dir).ok();
 
-    eprintln!("cargo:warning=Building dinput8.dll with {cc}");
-    match cmd.status() {
-        Ok(s) if s.success() => copy_dll_to_bin_dir(dll_out, out_dir),
-        Ok(s) => eprintln!(
-            "cargo:warning=DLL build failed (exit {:?}); check libz-mingw-w64-dev",
-            s.code()
-        ),
-        Err(e) => eprintln!("cargo:warning=Failed to run {cc}: {e}"),
+    let mut cfg = Command::new("cmake");
+    cfg.arg(wrapper_dir)
+        .arg("-B")
+        .arg(&build_dir)
+        .arg("-DCMAKE_BUILD_TYPE=Release");
+
+    if let Some(tc) = toolchain_file {
+        cfg.arg(format!("-DCMAKE_TOOLCHAIN_FILE={}", tc.display()));
     }
+
+    cfg.arg("-DCMAKE_INSTALL_PREFIX=UNUSED");
+
+    eprintln!("cargo:warning=cmake configure: {wrapper_dir:?}");
+    let st = cfg.status();
+    match st {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("cargo:warning=cmake configure failed (exit {:?})", s.code());
+            return None;
+        }
+        Err(e) => {
+            eprintln!("cargo:warning=cmake not found: {e}");
+            return None;
+        }
+    }
+
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "4".to_string());
+
+    let st = Command::new("cmake")
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--config")
+        .arg("Release")
+        .arg("--parallel")
+        .arg(&nproc)
+        .status();
+    match st {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("cargo:warning=cmake build failed (exit {:?})", s.code());
+            return None;
+        }
+        Err(e) => {
+            eprintln!("cargo:warning=cmake --build failed: {e}");
+            return None;
+        }
+    }
+
+    for sub in &["", "Release", "RelWithDebInfo"] {
+        let candidate = if sub.is_empty() {
+            build_dir.join("dinput8.dll")
+        } else {
+            build_dir.join(sub).join("dinput8.dll")
+        };
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    eprintln!("cargo:warning=cmake build succeeded but dinput8.dll not found in {build_dir:?}");
+    None
 }
 
-fn build_msvc(sources: &[PathBuf], def: &Path,
-              include: &Path, dll_out: &Path, out_dir: &Path) {
-    let mut cmd = Command::new("cl");
-    cmd.args(["/nologo", "/LD", "/MD", "/std:c++17", "/EHsc", "/O2"])
-       .arg(format!("/Fe:{}", dll_out.display()))
-       .arg("/I").arg(include)
-       .args(sources)
-       .arg("/link")
-       .arg(format!("/DEF:{}", def.display()))
-       .args(["zlibstatic.lib", "/NODEFAULTLIB:LIBCMT"]);
+fn write_mingw_toolchain(out_dir: &Path, triple: &str) -> PathBuf {
+    let path = out_dir.join("mingw-toolchain.cmake");
+    let content = format!(
+        r#"set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
-    eprintln!("cargo:warning=Building dinput8.dll with cl.exe (MSVC)");
-    match cmd.status() {
-        Ok(s) if s.success() => copy_dll_to_bin_dir(dll_out, out_dir),
-        Ok(s) => eprintln!(
-            "cargo:warning=MSVC DLL build failed (exit {:?}); ensure zlib.lib is in LIB",
-            s.code()
-        ),
-        Err(e) => eprintln!("cargo:warning=Failed to run cl.exe: {e}"),
-    }
+set(CMAKE_C_COMPILER   {triple}-gcc)
+set(CMAKE_CXX_COMPILER {triple}-g++)
+set(CMAKE_RC_COMPILER  {triple}-windres)
+
+set(CMAKE_FIND_ROOT_PATH /usr/{triple})
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+"#,
+        triple = triple
+    );
+    fs::write(&path, content).expect("failed to write toolchain file");
+    path
 }
 
 fn main() {
-    let host    = env::var("HOST").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let wrapper_src = manifest.join("wrapper").join("src");
-    let def_file    = manifest.join("wrapper").join("dinput8.def");
+
+    let wrapper_dir = manifest.join("wrapper");
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={}", def_file.display());
+    for glob_root in [wrapper_dir.join("src"), wrapper_dir.join("third_party")] {
+        println!("cargo:rerun-if-changed={}", glob_root.display());
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        wrapper_dir.join("CMakeLists.txt").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        wrapper_dir.join("dinput8.def").display()
+    );
 
-    let sources: Vec<PathBuf> = match fs::read_dir(&wrapper_src) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == "cpp").unwrap_or(false))
-            .inspect(|p| println!("cargo:rerun-if-changed={}", p.display()))
-            .collect(),
-        Err(e) => {
-            eprintln!("cargo:warning=Cannot read {}: {e}", wrapper_src.display());
-            return;
-        }
-    };
-
-    if sources.is_empty() {
-        eprintln!("cargo:warning=No .cpp sources found in {}, skipping DLL build",
-                  wrapper_src.display());
+    if !probe("cmake") {
+        eprintln!("cargo:warning=cmake not found — install cmake to build dinput8.dll");
         return;
     }
 
-    let dll_out = out_dir.join("dinput8.dll");
+    let dll = if host.contains("linux") {
+        let triple = ["x86_64-w64-mingw32", "i686-w64-mingw32"]
+            .iter()
+            .copied()
+            .find(|t| probe(&format!("{t}-gcc")));
 
-    if host.contains("linux") {
-        let cc = ["x86_64-w64-mingw32-g++", "i686-w64-mingw32-g++"]
-            .iter().copied()
-            .find(|&c| probe(c));
-        match cc {
-            Some(c) => build_mingw(c, &sources, &def_file, &wrapper_src, &dll_out, &out_dir),
-            None    => eprintln!(
-                "cargo:warning=mingw not found — install mingw-w64 to build dinput8.dll"
-            ),
+        match triple {
+            Some(t) => {
+                let tc = write_mingw_toolchain(&out_dir, t);
+                eprintln!("cargo:warning=Cross-compiling with {t} via CMake");
+                build_cmake(&wrapper_dir, &out_dir, Some(&tc))
+            }
+            None => {
+                eprintln!(
+                    "cargo:warning=No MinGW cross-compiler found. \
+                     Install mingw-w64 (x86_64-w64-mingw32-gcc)."
+                );
+                None
+            }
         }
     } else if host.contains("windows") {
-        if probe("cl") {
-            build_msvc(&sources, &def_file, &wrapper_src, &dll_out, &out_dir);
-        } else if probe("x86_64-w64-mingw32-g++") {
-            build_mingw("x86_64-w64-mingw32-g++", &sources, &def_file,
-                        &wrapper_src, &dll_out, &out_dir);
-        } else if probe("g++") {
-            build_mingw("g++", &sources, &def_file,
-                        &wrapper_src, &dll_out, &out_dir);
-        } else {
-            eprintln!("cargo:warning=No C++ compiler found on Windows, skipping DLL build");
-        }
+        eprintln!("cargo:warning=Building dinput8.dll via CMake (native Windows)");
+        build_cmake(&wrapper_dir, &out_dir, None)
     } else {
-        eprintln!("cargo:warning=Host {host} unsupported for DLL build, skipping");
+        eprintln!("cargo:warning=Host {host} not supported for DLL build");
+        None
+    };
+
+    if let Some(dll_path) = dll {
+        copy_dll_to_bin_dir(&dll_path, &out_dir);
     }
 }

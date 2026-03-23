@@ -199,6 +199,7 @@ pub fn create_font_patch(
     pak: &UPKPak,
     font_object_name: &str,
     cfg: &FontConfig,
+    package_name: &str,
     out_dir: &Path,
 ) -> Result<()> {
     let ver = header.p_ver;
@@ -283,15 +284,7 @@ pub fn create_font_patch(
         &r.fchars, &tex_refs, r.em_scale, r.ascent, r.descent, r.leading, &nt, ver,
     );
 
-    let pkg_name = {
-        let parts: Vec<&str> = font_path_name.split('.').collect();
-        if parts.len() > 1 {
-            parts[0].to_string()
-        } else {
-            font_path_name.clone()
-        }
-    };
-
+    let pkg_name = package_name.to_string();
     let mut patch = LinkerPatchData::new(pkg_name.clone());
 
     let font_inner_path = strip_package_prefix(&font_path_name, &pkg_name);
@@ -321,8 +314,12 @@ pub fn create_font_patch(
 
     std::fs::create_dir_all(out_dir)?;
     let out_path = out_dir.join(format!("ScriptPatch_{}.bin", pkg_name));
-    let bin = compress_patch(&patch)?;
+    let (bin, unc) = compress_patch(&patch)?;
     std::fs::write(&out_path, &bin)?;
+    std::fs::write(
+        format!("{}.uncompressed_size", out_path.display()),
+        format!("{}", unc),
+    )?;
 
     println!(
         "Wrote font patch: {}  ({} CDO patch(es))",

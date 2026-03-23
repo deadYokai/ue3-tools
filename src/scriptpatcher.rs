@@ -9,6 +9,12 @@ use std::{
     io::{self, Read, Write},
 };
 
+pub const PACKAGE_FILE_TAG: u32 = 0x9E2A83C1;
+
+pub const COMPRESS_ZLIB: i32 = 1;
+
+pub const CHUNK_SIZE: usize = 0x20000;
+
 pub fn write_ue3_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     if s.is_empty() {
         return w.write_i32::<LittleEndian>(0);
@@ -32,7 +38,6 @@ pub fn read_ue3_string<R: Read>(r: &mut R) -> io::Result<String> {
         }
         Ok(String::from_utf8_lossy(&b).into_owned())
     } else {
-        // UTF-16: len is -(char_count_including_null)
         let count = (-len) as usize;
         let mut chars = Vec::with_capacity(count);
         for _ in 0..count {
@@ -45,14 +50,12 @@ pub fn read_ue3_string<R: Read>(r: &mut R) -> io::Result<String> {
     }
 }
 
-/// Write TArray<BYTE>: `i32 count` + raw bytes.
-fn write_bytes_array<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
+fn write_byte_array<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
     w.write_i32::<LittleEndian>(data.len() as i32)?;
     w.write_all(data)
 }
 
-/// Read TArray<BYTE>.
-fn read_bytes_array<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+fn read_byte_array<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let n = r.read_i32::<LittleEndian>()?;
     if n <= 0 {
         return Ok(Vec::new());
@@ -61,9 +64,6 @@ fn read_bytes_array<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     r.read_exact(&mut b)?;
     Ok(b)
 }
-
-// ─── FPatchData ───────────────────────────────────────────────────────────────
-// C++: FString DataName;  TArray<BYTE> Data;
 
 #[derive(Debug, Clone)]
 pub struct PatchData {
@@ -78,22 +78,16 @@ impl PatchData {
 
     pub fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
         write_ue3_string(w, &self.data_name)?;
-        write_bytes_array(w, &self.data)
+        write_byte_array(w, &self.data)
     }
 
     pub fn deserialize<R: Read>(r: &mut R) -> io::Result<Self> {
         Ok(Self {
             data_name: read_ue3_string(r)?,
-            data: read_bytes_array(r)?,
+            data: read_byte_array(r)?,
         })
     }
 }
-
-// ─── FScriptPatchData ─────────────────────────────────────────────────────────
-// C++: FName StructName; (inherits FPatchData: FString DataName; TArray<BYTE> Data)
-// operator<<: Ar << StructName << (FPatchData&)Patch
-//   → StructName via FPatchBinaryWriter override → FString
-//   → DataName as plain FString, Data as TArray<BYTE>
 
 #[derive(Debug, Clone)]
 pub struct ScriptPatchData {
@@ -110,8 +104,8 @@ impl ScriptPatchData {
     }
 
     pub fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        write_ue3_string(w, &self.struct_name)?; // StructName first (FName→FString)
-        self.patch_data.serialize(w) // then DataName (FString) + Data (TArray<BYTE>)
+        write_ue3_string(w, &self.struct_name)?;
+        self.patch_data.serialize(w)
     }
 
     pub fn deserialize<R: Read>(r: &mut R) -> io::Result<Self> {
@@ -133,10 +127,6 @@ impl ScriptPatchData {
             .unwrap_or(&self.patch_data.data_name)
     }
 }
-
-// ─── FEnumPatchData ───────────────────────────────────────────────────────────
-// C++: FName EnumName; FString EnumPathName; TArray<FName> EnumValues;
-// All FName via override → FString.
 
 #[derive(Debug, Clone)]
 pub struct EnumPatchData {
@@ -180,15 +170,114 @@ impl EnumPatchData {
     }
 }
 
-// ─── FLinkerPatchData ─────────────────────────────────────────────────────────
-// C++ serialize order (from UnScriptPatcher.cpp):
-//   PackageName, Names, Exports, Imports,
-//   NewObjects, ModifiedClassDefaultObjects, ModifiedEnums, ScriptPatches
+#[derive(Debug, Clone, Default)]
+pub struct PatchExport {
+    pub class_index: i32,
+    pub super_index: i32,
+    pub outer_index: i32,
+    pub object_name: String,
+    pub archetype_index: i32,
+    pub object_flags: u64,
+    pub serial_size: i32,
+    pub serial_offset: i32,
+    pub export_flags: u32,
+    pub generation_net_object_count: Vec<i32>,
+    pub package_guid: [u32; 4],
+    pub package_flags: u32,
+}
+
+impl PatchExport {
+    pub fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_i32::<LittleEndian>(self.class_index)?;
+        w.write_i32::<LittleEndian>(self.super_index)?;
+        w.write_i32::<LittleEndian>(self.outer_index)?;
+        write_ue3_string(w, &self.object_name)?;
+        w.write_i32::<LittleEndian>(self.archetype_index)?;
+        w.write_u64::<LittleEndian>(self.object_flags)?;
+        w.write_i32::<LittleEndian>(self.serial_size)?;
+        w.write_i32::<LittleEndian>(self.serial_offset)?;
+        w.write_u32::<LittleEndian>(self.export_flags)?;
+        w.write_i32::<LittleEndian>(self.generation_net_object_count.len() as i32)?;
+        for &v in &self.generation_net_object_count {
+            w.write_i32::<LittleEndian>(v)?;
+        }
+        for &g in &self.package_guid {
+            w.write_u32::<LittleEndian>(g)?;
+        }
+        w.write_u32::<LittleEndian>(self.package_flags)
+    }
+
+    pub fn deserialize<R: Read>(r: &mut R) -> io::Result<Self> {
+        let class_index = r.read_i32::<LittleEndian>()?;
+        let super_index = r.read_i32::<LittleEndian>()?;
+        let outer_index = r.read_i32::<LittleEndian>()?;
+        let object_name = read_ue3_string(r)?;
+        let archetype_index = r.read_i32::<LittleEndian>()?;
+        let object_flags = r.read_u64::<LittleEndian>()?;
+        let serial_size = r.read_i32::<LittleEndian>()?;
+        let serial_offset = r.read_i32::<LittleEndian>()?;
+        let export_flags = r.read_u32::<LittleEndian>()?;
+        let gen_count = r.read_i32::<LittleEndian>()? as usize;
+        let mut gen_net = Vec::with_capacity(gen_count);
+        for _ in 0..gen_count {
+            gen_net.push(r.read_i32::<LittleEndian>()?);
+        }
+        let guid = [
+            r.read_u32::<LittleEndian>()?,
+            r.read_u32::<LittleEndian>()?,
+            r.read_u32::<LittleEndian>()?,
+            r.read_u32::<LittleEndian>()?,
+        ];
+        let package_flags = r.read_u32::<LittleEndian>()?;
+        Ok(Self {
+            class_index,
+            super_index,
+            outer_index,
+            object_name,
+            archetype_index,
+            object_flags,
+            serial_size,
+            serial_offset,
+            export_flags,
+            generation_net_object_count: gen_net,
+            package_guid: guid,
+            package_flags,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PatchImport {
+    pub class_package: String,
+    pub class_name: String,
+    pub outer_index: i32,
+    pub object_name: String,
+}
+
+impl PatchImport {
+    pub fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        write_ue3_string(w, &self.class_package)?;
+        write_ue3_string(w, &self.class_name)?;
+        w.write_i32::<LittleEndian>(self.outer_index)?;
+        write_ue3_string(w, &self.object_name)
+    }
+
+    pub fn deserialize<R: Read>(r: &mut R) -> io::Result<Self> {
+        Ok(Self {
+            class_package: read_ue3_string(r)?,
+            class_name: read_ue3_string(r)?,
+            outer_index: r.read_i32::<LittleEndian>()?,
+            object_name: read_ue3_string(r)?,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LinkerPatchData {
     pub package_name: String,
     pub names: Vec<String>,
+    pub exports: Vec<PatchExport>,
+    pub imports: Vec<PatchImport>,
     pub new_objects: Vec<PatchData>,
     pub modified_class_default_objects: Vec<PatchData>,
     pub modified_enums: Vec<EnumPatchData>,
@@ -200,6 +289,8 @@ impl LinkerPatchData {
         Self {
             package_name: pkg,
             names: Vec::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
             new_objects: Vec::new(),
             modified_class_default_objects: Vec::new(),
             modified_enums: Vec::new(),
@@ -207,8 +298,19 @@ impl LinkerPatchData {
         }
     }
 
-    pub fn add_script_patch(&mut self, p: ScriptPatchData) {
-        self.script_patches.push(p);
+    pub fn add_name(&mut self, n: String) {
+        self.names.push(n);
+    }
+
+    pub fn add_export(&mut self, e: PatchExport) {
+        self.exports.push(e);
+    }
+    pub fn add_import(&mut self, i: PatchImport) {
+        self.imports.push(i);
+    }
+
+    pub fn add_new_object(&mut self, path: String, data: Vec<u8>) {
+        self.new_objects.push(PatchData::new(path, data));
     }
     pub fn add_cdo_patch(&mut self, p: PatchData) {
         self.modified_class_default_objects.push(p);
@@ -216,49 +318,43 @@ impl LinkerPatchData {
     pub fn add_enum_patch(&mut self, p: EnumPatchData) {
         self.modified_enums.push(p);
     }
-    pub fn add_new_object(&mut self, path: String, data: Vec<u8>) {
-        self.new_objects.push(PatchData::new(path, data));
-    }
-    pub fn add_name(&mut self, n: String) {
-        self.names.push(n);
+    pub fn add_script_patch(&mut self, p: ScriptPatchData) {
+        self.script_patches.push(p);
     }
 
-    /// Serialize to the uncompressed binary stream read by FPatchBinaryReader.
     pub fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        // 1. PackageName (FName → FString)
         write_ue3_string(w, &self.package_name)?;
 
-        // 2. Names (TArray<FName → FString>)
         w.write_i32::<LittleEndian>(self.names.len() as i32)?;
         for n in &self.names {
             write_ue3_string(w, n)?;
         }
 
-        // 3. Exports (TArray<FObjectExport>) — empty; tool never adds exports
-        w.write_i32::<LittleEndian>(0)?;
+        w.write_i32::<LittleEndian>(self.exports.len() as i32)?;
+        for e in &self.exports {
+            e.serialize(w)?;
+        }
 
-        // 4. Imports (TArray<FObjectImport>) — empty
-        w.write_i32::<LittleEndian>(0)?;
+        w.write_i32::<LittleEndian>(self.imports.len() as i32)?;
+        for i in &self.imports {
+            i.serialize(w)?;
+        }
 
-        // 5. NewObjects (TArray<FPatchData>)
         w.write_i32::<LittleEndian>(self.new_objects.len() as i32)?;
         for o in &self.new_objects {
             o.serialize(w)?;
         }
 
-        // 6. ModifiedClassDefaultObjects (TArray<FPatchData>)
         w.write_i32::<LittleEndian>(self.modified_class_default_objects.len() as i32)?;
         for c in &self.modified_class_default_objects {
             c.serialize(w)?;
         }
 
-        // 7. ModifiedEnums (TArray<FEnumPatchData>)
         w.write_i32::<LittleEndian>(self.modified_enums.len() as i32)?;
         for e in &self.modified_enums {
             e.serialize(w)?;
         }
 
-        // 8. ScriptPatches (TArray<FScriptPatchData>)
         w.write_i32::<LittleEndian>(self.script_patches.len() as i32)?;
         for p in &self.script_patches {
             p.serialize(w)?;
@@ -276,25 +372,16 @@ impl LinkerPatchData {
             names.push(read_ue3_string(r)?);
         }
 
-        let ec = r.read_i32::<LittleEndian>()?;
-        if ec != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "patch has {} Exports — full FObjectExport deserialize not implemented",
-                    ec
-                ),
-            ));
+        let ec = r.read_i32::<LittleEndian>()? as usize;
+        let mut exports = Vec::with_capacity(ec);
+        for _ in 0..ec {
+            exports.push(PatchExport::deserialize(r)?);
         }
-        let ic = r.read_i32::<LittleEndian>()?;
-        if ic != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "patch has {} Imports — full FObjectImport deserialize not implemented",
-                    ic
-                ),
-            ));
+
+        let ic = r.read_i32::<LittleEndian>()? as usize;
+        let mut imports = Vec::with_capacity(ic);
+        for _ in 0..ic {
+            imports.push(PatchImport::deserialize(r)?);
         }
 
         let no_c = r.read_i32::<LittleEndian>()? as usize;
@@ -324,6 +411,8 @@ impl LinkerPatchData {
         Ok(Self {
             package_name,
             names,
+            exports,
+            imports,
             new_objects,
             modified_class_default_objects: cdos,
             modified_enums: enums,
@@ -331,20 +420,13 @@ impl LinkerPatchData {
         })
     }
 }
-
-// ─── Compression ─────────────────────────────────────────────────────────────
-// Matches UE3 FArchive::SerializeCompressed with GBaseCompressionMethod = COMPRESS_ZLIB.
-
-const BLOCK_SIZE: usize = 0x20000; // 128 KiB — matches UE3 default chunk size
-
-/// Serialize and compress a patch into the `.bin` format loaded by `FScriptPatcher::GetLinkerPatch`.
-pub fn compress_patch(patch: &LinkerPatchData) -> io::Result<Vec<u8>> {
+pub fn compress_patch(patch: &LinkerPatchData) -> io::Result<(Vec<u8>, usize)> {
     let mut unc: Vec<u8> = Vec::new();
     patch.serialize(&mut unc)?;
-    let unc_total = unc.len() as u32;
+    let unc_total = unc.len();
 
     let blocks: Vec<Vec<u8>> = unc
-        .chunks(BLOCK_SIZE)
+        .chunks(CHUNK_SIZE)
         .map(|chunk| {
             let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
             enc.write_all(chunk).unwrap();
@@ -352,38 +434,69 @@ pub fn compress_patch(patch: &LinkerPatchData) -> io::Result<Vec<u8>> {
         })
         .collect();
 
-    let bcount = blocks.len();
-    let comp_total: u32 = blocks.iter().map(|b| b.len() as u32).sum();
+    let n = blocks.len();
+    let cmp_total: usize = blocks.iter().map(|b| b.len()).sum();
 
-    let mut out = Vec::new();
-    out.extend_from_slice(&unc_total.to_le_bytes());
-    out.extend_from_slice(&comp_total.to_le_bytes());
+    let mut out = Vec::with_capacity(8 + 8 + n * 8 + cmp_total);
+
+    out.extend_from_slice(&PACKAGE_FILE_TAG.to_le_bytes());
+    out.extend_from_slice(&(COMPRESS_ZLIB as u32).to_le_bytes());
+    out.extend_from_slice(&(unc_total as i32).to_le_bytes());
+    out.extend_from_slice(&(cmp_total as i32).to_le_bytes());
+
     for (i, block) in blocks.iter().enumerate() {
-        let unc_sz = if i == bcount - 1 {
-            unc.len() - i * BLOCK_SIZE
+        let unc_sz = if i == n - 1 {
+            unc_total - i * CHUNK_SIZE
         } else {
-            BLOCK_SIZE
+            CHUNK_SIZE
         };
-        out.extend_from_slice(&(block.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(unc_sz as u32).to_le_bytes());
+        out.extend_from_slice(&(block.len() as i32).to_le_bytes());
+        out.extend_from_slice(&(unc_sz as i32).to_le_bytes());
     }
+
     for block in &blocks {
         out.extend_from_slice(block);
     }
-    Ok(out)
+
+    Ok((out, unc_total))
 }
 
-/// Decompress and deserialize a `.bin` patch file.
+pub fn uncompressed_size_from(compressed: &[u8]) -> Option<u32> {
+    if compressed.len() < 12 {
+        return None;
+    }
+    let tag = u32::from_le_bytes(compressed[0..4].try_into().unwrap());
+    if tag != PACKAGE_FILE_TAG {
+        return None;
+    }
+    let sz = i32::from_le_bytes(compressed[8..12].try_into().unwrap());
+    if sz < 0 { None } else { Some(sz as u32) }
+}
+
 pub fn load_patch_bin(data: &[u8]) -> io::Result<LinkerPatchData> {
-    if data.len() < 8 {
+    if data.len() < 16 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "patch file too small",
         ));
     }
-    let unc_total = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let bcount = (unc_total + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    let hdrs_end = 8 + bcount * 8;
+
+    // Verify PACKAGE_FILE_TAG
+    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    if tag != PACKAGE_FILE_TAG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "bad magic: expected 0x{:08X}, got 0x{:08X}",
+                PACKAGE_FILE_TAG, tag
+            ),
+        ));
+    }
+
+    let unc_total = i32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+    let n_blocks = (unc_total + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let hdrs_end = 16 + n_blocks * 8;
     if data.len() < hdrs_end {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -393,30 +506,43 @@ pub fn load_patch_bin(data: &[u8]) -> io::Result<LinkerPatchData> {
 
     let mut unc: Vec<u8> = Vec::with_capacity(unc_total);
     let mut pos = hdrs_end;
-    for i in 0..bcount {
-        let h = 8 + i * 8;
-        let csz = u32::from_le_bytes(data[h..h + 4].try_into().unwrap()) as usize;
-        let mut dec = ZlibDecoder::new(&data[pos..pos + csz]);
+
+    for i in 0..n_blocks {
+        let h = 16 + i * 8;
+        let cmp_sz = i32::from_le_bytes(data[h..h + 4].try_into().unwrap()) as usize;
+
+        if pos + cmp_sz > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "block {} extends past EOF (need {} bytes at offset {})",
+                    i, cmp_sz, pos
+                ),
+            ));
+        }
+
+        let mut dec = ZlibDecoder::new(&data[pos..pos + cmp_sz]);
         let mut blk = Vec::new();
         dec.read_to_end(&mut blk)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         unc.extend_from_slice(&blk);
-        pos += csz;
+        pos += cmp_sz;
+    }
+
+    if unc.len() != unc_total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "decompressed {} bytes but header said {}",
+                unc.len(),
+                unc_total
+            ),
+        ));
     }
 
     LinkerPatchData::deserialize(&mut unc.as_slice())
 }
 
-// ─── Offline UPK patching ─────────────────────────────────────────────────────
-
-/// Returns `(serial_size_file_pos, serial_offset_file_pos)` for every export entry.
-///
-/// From `Export::read` the layout before `serial_size` is always:
-///   class_index(4) + super_index(4) + outer_index(4)
-///   + object_name(8) + archetype(4) + object_flags(8)
-///   = 32 bytes fixed, for ALL versions.
-/// The legacy_component_map (ver < 543) comes AFTER serial_offset, so
-/// serial_size is always at entry_start + 32 and serial_offset at + 36.
 fn export_serial_positions(raw: &[u8], header: &UpkHeader) -> Vec<(usize, usize)> {
     let mut pos = header.export_offset as usize;
     let mut result = Vec::with_capacity(header.export_count as usize);
@@ -427,43 +553,33 @@ fn export_serial_positions(raw: &[u8], header: &UpkHeader) -> Vec<(usize, usize)
         }
         result.push((pos + 32, pos + 36));
 
-        // Advance: fixed 40-byte prefix (32 + serial_size(4) + serial_offset(4))
         pos += 40;
 
-        // Legacy component map only on ver < 543
         if header.p_ver < 543 {
             if pos + 4 > raw.len() {
                 break;
             }
             let cnt = i32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
-            pos += 4 + cnt * 12; // each entry: FName(8) + i32(4)
+            pos += 4 + cnt * 12;
         }
 
         if pos + 4 > raw.len() {
             break;
         }
-        pos += 4; // export_flags
+        pos += 4;
 
         if pos + 4 > raw.len() {
             break;
         }
         let gc = i32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
-        pos += 4 + gc * 4; // gen_count + gen_count * i32
+        pos += 4 + gc * 4;
 
-        pos += 20; // package_guid(16) + package_flags(4)
+        pos += 20;
     }
 
     result
 }
 
-/// Apply a `LinkerPatchData` to a raw UPK buffer, returning the (possibly resized) patched file.
-///
-/// For each script patch:
-/// 1. Finds the export whose full name contains `function_path`.
-/// 2. Extracts the current Script bytecode from the export blob.
-/// 3. Locates the `TArray<BYTE>` (`i32 count` + bytes) in the blob.
-/// 4. Replaces it with the new bytecode.
-/// 5. Rebuilds the data section with updated `serial_size` / `serial_offset`.
 pub fn apply_patches_to_upk(
     upk_raw: &[u8],
     header: &UpkHeader,
@@ -520,7 +636,7 @@ pub fn apply_patches_to_upk(
             .chain(old_script.iter())
             .copied()
             .collect();
-        let tarray_off = match blob
+        let arr_off = match blob
             .windows(search.len())
             .position(|w| w == search.as_slice())
         {
@@ -536,10 +652,10 @@ pub fn apply_patches_to_upk(
 
         let new_bc = &sp.patch_data.data;
         let mut new_blob = Vec::new();
-        new_blob.extend_from_slice(&blob[..tarray_off]);
+        new_blob.extend_from_slice(&blob[..arr_off]);
         new_blob.extend_from_slice(&(new_bc.len() as i32).to_le_bytes());
         new_blob.extend_from_slice(new_bc);
-        new_blob.extend_from_slice(&blob[tarray_off + 4 + old_script.len()..]);
+        new_blob.extend_from_slice(&blob[arr_off + 4 + old_script.len()..]);
 
         println!(
             "  script patch '{}': {} → {} bytes",
@@ -554,11 +670,9 @@ pub fn apply_patches_to_upk(
         let needle = cdo.data_name.to_lowercase();
 
         let found = pak.export_table.iter().enumerate().find(|(i, _)| {
-            let full = pak.get_export_full_name((*i + 1) as i32); // "Class Pkg.Obj"
-            let path = pak.get_export_path_name((*i + 1) as i32); // "Pkg.Obj"
-
-            // Strip the first path component (package name) for comparison
-            let inner = strip_pkg_from_path(&path);
+            let full = pak.get_export_full_name((*i + 1) as i32);
+            let path = pak.get_export_path_name((*i + 1) as i32);
+            let inner = strip_pkg_prefix(&path);
             inner.to_lowercase() == needle || full.to_lowercase().contains(&needle)
         });
 
@@ -573,15 +687,13 @@ pub fn apply_patches_to_upk(
             }
         };
 
-        let path = pak.get_export_path_name((exp_idx + 1) as i32);
         println!(
             "  CDO patch '{}' → export '{}'  ({} → {} bytes)",
             cdo.data_name,
-            path,
+            pak.get_export_path_name((exp_idx + 1) as i32),
             exp.serial_size,
             cdo.data.len()
         );
-
         replacements.insert(exp_idx, cdo.data.clone());
     }
 
@@ -589,10 +701,6 @@ pub fn apply_patches_to_upk(
         println!("  no exports matched — UPK unchanged");
         return Ok(upk_raw.to_vec());
     }
-
-    // ── Rebuild the file ──────────────────────────────────────────────────────
-
-    // All exports with data, sorted by their original serial_offset.
 
     let mut order: Vec<usize> = (0..pak.export_table.len())
         .filter(|&i| pak.export_table[i].serial_size > 0)
@@ -647,7 +755,7 @@ pub fn apply_patches_to_upk(
     Ok(new_file)
 }
 
-fn strip_pkg_from_path(path: &str) -> &str {
+fn strip_pkg_prefix(path: &str) -> &str {
     if let Some(dot) = path.find('.') {
         &path[dot + 1..]
     } else {
