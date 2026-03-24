@@ -1007,6 +1007,10 @@ pub fn create_font_blobs(cfg: &FontConfig, out_dir: &Path) -> Result<()> {
         );
     }
 
+    let nm_path = out_dir.join(format!("{}.namemap", pkg));
+    fs::write(&nm_path, nt.names.join("\n") + "\n")?;
+    println!(" namemap  -  {}", nm_path.display());
+
     println!(
         "blobs done — {} char(s), {} page(s)",
         r.fchars.iter().filter(|c| c.u_size > 0).count(),

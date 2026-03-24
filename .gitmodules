@@ -1,3 +1,0 @@
-[submodule "wrapper/third_party/zydis"]
-	path = wrapper/third_party/zydis
-	url = https://github.com/zyantific/zydis.git

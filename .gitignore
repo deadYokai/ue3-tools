@@ -1,4 +1,7 @@
 /target
 /test_mod
 /testing_files
+
+/wrapper/build
+
 Cargo.lock
