@@ -55,9 +55,9 @@ std::vector<ObjectReplacement> parse(const std::string &text,
 		}
 
 		auto orig_dot = cur_orig.rfind('.');
-		std::string obj_name =
-		    (orig_dot != std::string::npos) ? cur_orig.substr(orig_dot + 1)
-		                                    : cur_orig;
+		std::string obj_name = (orig_dot != std::string::npos)
+		                           ? cur_orig.substr(orig_dot + 1)
+		                           : cur_orig;
 
 		std::string repl_full = cur_repl;
 		auto repl_dot = cur_repl.rfind('.');
@@ -70,7 +70,7 @@ std::vector<ObjectReplacement> parse(const std::string &text,
 		std::string repl_pkg_lo = to_lower(repl_pkg);
 
 		std::wstring file_path;
-		std::string  ue3_class;
+		std::string ue3_class;
 		try {
 			for (const auto &e : fs::directory_iterator(mod_dir)) {
 				if (!e.is_regular_file())
@@ -89,10 +89,11 @@ std::vector<ObjectReplacement> parse(const std::string &text,
 		}
 
 		ObjectReplacement r;
-		r.orig_obj    = obj_name;
+		r.orig_obj = obj_name;
+		r.orig_full_path = cur_orig;
 		r.repl_path_w = to_wide(repl_full);
-		r.mod_upk_w   = file_path;
-		r.ue3_class   = ue3_class;
+		r.mod_upk_w = file_path;
+		r.ue3_class = ue3_class;
 		out.push_back(std::move(r));
 		cur_orig.clear();
 		cur_repl.clear();

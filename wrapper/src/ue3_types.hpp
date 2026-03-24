@@ -28,6 +28,19 @@ struct FStringLayout {
 };
 static_assert(sizeof(FStringLayout) == 16);
 
+struct FNameEntry_hdr {
+	uint64_t _flags;
+	uint32_t EncodedIndex;
+};
+static constexpr size_t kFNameEntry_StrOff = 0x14;
+static constexpr uint32_t kFNameEntry_UnicodeBit = 1u;
+
+struct FNamesArray {
+	FNameEntry_hdr **Data;
+	int32_t Num;
+	int32_t Max;
+};
+
 namespace LinkerOff {
 static constexpr ptrdiff_t LinkerRoot = 0x005c;
 static constexpr ptrdiff_t NameMap = 0x011c;
@@ -71,14 +84,15 @@ using FindPackageFile_fn = int(__fastcall *)(void *, const wchar_t *, void *,
 	"48 8B C4 4C 89 48 20 48 89 50 10 48 89 48 08 53 56 57 48 81 EC F0 00"
 
 #define PATTERN_GetPackageLinker                                               \
-	"40 53 56 57 41 54 41 55 41 56 41 57 48 81 ec d0 02 00 00 48 c7 84 24 b8 " \
-	"00 00 00 fe ff ff ff 48 8b 05 ?? ?? ?? ??"
+	"40 53 56 57 41 54 41 55 41 56 41 57 48 81 ec d0 02 00 00 48 c7 84 24 "    \
+	"b8 00 00 00 fe ff ff ff 48 8b 05 ?? ?? ?? ??"
 
 struct UE3Addrs {
 	FNameInit_fn FNameInit = nullptr;
 	StaticFindObjectFast_fn StaticFindObjectFast = nullptr;
 	StaticLoadObject_fn StaticLoadObject = nullptr;
 	void **GPackageFileCache = nullptr;
+	FNamesArray *FNameNames = nullptr;
 };
 
 extern UE3Addrs g_ue3;
@@ -97,25 +111,71 @@ inline bool ue3_resolve(UE3Addrs &out) {
 	    FindPatternString(exe, PATTERN_StaticLoadObject));
 
 	{
-		auto *gplinker = static_cast<uint8_t *>(
+		auto *gpl = static_cast<uint8_t *>(
 		    FindPatternString(exe, PATTERN_GetPackageLinker));
-
-		if (gplinker) {
-			constexpr size_t kScanWindow = 0x300;
-			uint8_t *mov = nullptr;
-			for (size_t i = 0; i + 7 <= kScanWindow; ++i) {
-				if (gplinker[i] == 0x48 && gplinker[i + 1] == 0x8B &&
-				    gplinker[i + 2] == 0x0D) { // MOV RCX,[RIP+disp32]
-					mov = gplinker + i;
+		if (gpl) {
+			for (size_t i = 0; i + 7 <= 0x300; ++i) {
+				if (gpl[i] == 0x48 && gpl[i + 1] == 0x8B &&
+				    gpl[i + 2] == 0x0D) {
+					int32_t disp;
+					memcpy(&disp, gpl + i + 3, 4);
+					out.GPackageFileCache =
+					    reinterpret_cast<void **>(gpl + i + 7 + disp);
 					break;
 				}
 			}
-			if (mov) {
-				int32_t disp = *reinterpret_cast<int32_t *>(mov + 3);
-				out.GPackageFileCache =
-				    reinterpret_cast<void **>(mov + 7 + disp);
+		}
+	}
+
+	if (out.FNameInit) {
+		auto scan_for_names = [](const uint8_t *start,
+		                         size_t len) -> FNamesArray * {
+			for (size_t i = 0; i + 7 <= len; ++i) {
+				if ((start[i] & 0xF8) != 0x48)
+					continue;
+				if (start[i + 1] != 0x8B)
+					continue;
+				if ((start[i + 2] & 0xC7) != 0x05)
+					continue;
+
+				int32_t disp;
+				memcpy(&disp, start + i + 3, 4);
+				auto *cand = reinterpret_cast<FNamesArray *>(
+				    const_cast<uint8_t *>(start) + i + 7 + disp);
+
+				if (!cand->Data || cand->Num < 100 || cand->Max < cand->Num)
+					continue;
+
+				FNameEntry_hdr *e0 = cand->Data[0];
+				if (!e0)
+					continue;
+				const char *s0 = reinterpret_cast<const char *>(
+				    reinterpret_cast<const uint8_t *>(e0) + kFNameEntry_StrOff);
+				if ((s0[0] != 'N' && s0[0] != 'n') || s0[1] != 'o' ||
+				    s0[2] != 'n' || s0[3] != 'e')
+					continue;
+
+				return cand;
+			}
+			return nullptr;
+		};
+
+		const auto *fn = reinterpret_cast<const uint8_t *>(out.FNameInit);
+
+		const uint8_t *init_body = nullptr;
+		for (size_t i = 0; i + 5 <= 0x80; ++i) {
+			if (fn[i] == 0xE8) {
+				int32_t rel;
+				memcpy(&rel, fn + i + 1, 4);
+				init_body = fn + i + 5 + rel;
+				break;
 			}
 		}
+
+		if (init_body)
+			out.FNameNames = scan_for_names(init_body, 0x800);
+		if (!out.FNameNames)
+			out.FNameNames = scan_for_names(fn, 0x600);
 	}
 
 	return out.FNameInit && out.StaticFindObjectFast && out.StaticLoadObject &&
@@ -134,6 +194,35 @@ inline FName fname_create(const wchar_t *str) {
 	if (ue3().FNameInit)
 		ue3().FNameInit(&out, str, 0, 1, 0);
 	return out;
+}
+
+inline std::string fname_str(int32_t idx) {
+	const FNamesArray *arr = ue3().FNameNames;
+	if (!arr || idx < 0 || idx >= arr->Num)
+		return {};
+	const FNameEntry_hdr *e = arr->Data[idx];
+	if (!e)
+		return {};
+	const auto *raw = reinterpret_cast<const uint8_t *>(e) + kFNameEntry_StrOff;
+	if (e->EncodedIndex & kFNameEntry_UnicodeBit) {
+		const wchar_t *ws = reinterpret_cast<const wchar_t *>(raw);
+		std::string s;
+		for (; *ws; ++ws)
+			s += (*ws < 128) ? static_cast<char>(*ws) : '?';
+		return s;
+	}
+	return std::string(reinterpret_cast<const char *>(raw));
+}
+
+inline std::string fname_to_string(FName n) {
+	std::string s = fname_str(n.Index);
+	if (s.empty())
+		return {};
+	if (n.Number > 0) {
+		s += '_';
+		s += std::to_string(n.Number - 1);
+	}
+	return s;
 }
 
 inline TArrayView<FName> linker_namemap(void *linker) {

@@ -16,21 +16,38 @@ std::once_flag g_once;
 std::vector<ObjectReplacement> g_replacements;
 std::mutex g_load_mtx;
 
-static void *resolve_ue3_class(const std::string &class_name) {
-	if (class_name.empty() || !ue3().StaticFindObjectFast)
+static void *resolve_ue3_class(ObjectReplacement &r) {
+	if (r.cls_resolved)
+		return r.cached_cls;
+
+	if (!ue3().StaticFindObjectFast)
 		return nullptr;
 
-	std::wstring wname = to_wide(class_name);
-	FName cls_name = fname_find(wname.c_str());
-	if (cls_name.Index == 0) {
-		log_warn("mod_loader: FName not found for class '%s'",
-		         class_name.c_str());
+	FName cls_name = fname_create(to_wide(r.ue3_class).c_str());
+	if (cls_name.Index == 0)
 		return nullptr;
-	}
 
-	void *cls = ue3().StaticFindObjectFast(nullptr, nullptr, cls_name, 0, 0, 0);
+	void *cls = ue3().StaticFindObjectFast(nullptr, nullptr, cls_name, 0, 1, 0);
 	if (!cls)
-		log_warn("mod_loader: UClass not found for '%s'", class_name.c_str());
+		return nullptr;
+	log_info("mod_loader: UClass '%s' resolved -> %p", r.ue3_class.c_str(),
+	         cls);
+	static std::once_flag s_manifest;
+	std::call_once(s_manifest, [&] {
+		log_info(
+		    "mod_loader: ── mod manifest (%zu entries) ────────────────────",
+		    g_replacements.size());
+		for (size_t i = 0; i < g_replacements.size(); ++i) {
+			const auto &e = g_replacements[i];
+			log_info("mod_loader:   [%zu] orig='%s'  class='%s'  repl='%ls'", i,
+			         e.orig_full_path.c_str(), e.ue3_class.c_str(),
+			         e.repl_path_w.c_str());
+		}
+		log_info(
+		    "mod_loader: ─────────────────────────────────────────────────");
+	});
+	r.cached_cls = cls;
+	r.cls_resolved = true;
 	return cls;
 }
 
@@ -48,9 +65,10 @@ static void load_mod_dir(const fs::path &dir) {
 
 	auto entries = mod_toml_mini::parse(text, dir.string());
 	for (auto &r : entries) {
-		log_info("mod_loader: entry orig='%s' repl='%ls' file='%ls' class='%s'",
-		         r.orig_obj.c_str(), r.repl_path_w.c_str(), r.mod_upk_w.c_str(),
-		         r.ue3_class.c_str());
+		log_info(
+		    "mod_loader: queued  orig='%s'  repl='%ls'  file='%ls'  class='%s'",
+		    r.orig_full_path.c_str(), r.repl_path_w.c_str(),
+		    r.mod_upk_w.c_str(), r.ue3_class.c_str());
 		g_replacements.push_back(std::move(r));
 	}
 
@@ -81,22 +99,63 @@ static void do_load() {
 		log_err("mod_loader: scan error: %s", ex.what());
 	}
 
-	log_info("mod_loader: ready — %zu object replacements",
+	log_info("mod_loader: ready — %zu replacement(s) queued",
 	         g_replacements.size());
 }
 
-static void *load_one(ObjectReplacement &r) {
-	auto *slo = ue3().StaticLoadObject;
-	if (!slo)
+static void *load_one(ObjectReplacement &r, void *outer, void *hook_cls) {
+	if (!ue3().StaticLoadObject)
 		return nullptr;
 
-	void *cls = resolve_ue3_class(r.ue3_class);
+	void *cls = resolve_ue3_class(r);
+	if (!cls)
+		return nullptr;
+
+	if (!r.orig_found) {
+		if (outer) {
+			r.orig_found = true;
+			r.orig_warned = true;
+			log_info("mod_loader: original '%s' confirmed via hook outer=%p",
+			         r.orig_full_path.c_str(), outer);
+		} else if (!r.orig_warned) {
+			r.orig_warned = true;
+			log_warn("mod_loader: original '%s' triggered with null outer "
+			         "— bAnyPackage call, proceeding anyway",
+			         r.orig_full_path.c_str());
+		}
+	}
+
 	const wchar_t *fp = r.mod_upk_w.empty() ? nullptr : r.mod_upk_w.c_str();
 
-	log_info("mod_loader: StaticLoadObject cls=%p path='%ls' file='%ls'", cls,
-	         r.repl_path_w.c_str(), fp ? fp : L"(null)");
+	log_info("mod_loader: StaticLoadObject  cls=%p  path='%ls'  (outer=null, "
+	         "file via hook)",
+	         cls, r.repl_path_w.c_str());
 
-	return slo(cls, nullptr, r.repl_path_w.c_str(), fp, 0, nullptr, 1);
+	void *result = ue3().StaticLoadObject(cls, nullptr, r.repl_path_w.c_str(),
+	                                      nullptr, 0, nullptr, 1);
+
+	if (!result) {
+		if (!r.slo_failed) {
+			r.slo_failed = true;
+			log_err("mod_loader: StaticLoadObject FAILED for '%ls' "
+			        "(cls=%p  outer=%p  file='%ls') — bad path, "
+			        "missing/corrupt file, "
+			        "or engine not ready; will keep retrying",
+			        r.repl_path_w.c_str(), cls, outer, fp ? fp : L"(null)");
+		}
+		return nullptr;
+	}
+
+	if (r.slo_failed) {
+		r.slo_failed = false;
+		log_info("mod_loader: StaticLoadObject recovered for '%ls' -> %p",
+		         r.repl_path_w.c_str(), result);
+	} else {
+		log_info("mod_loader: loaded replacement '%ls' -> %p",
+		         r.repl_path_w.c_str(), result);
+	}
+
+	return result;
 }
 
 } // namespace
@@ -105,36 +164,21 @@ namespace mod_loader {
 
 void ensure_loaded() { std::call_once(g_once, do_load); }
 
-void preload_objects() {
-	if (!ue3().StaticLoadObject) {
-		log_err("mod_loader: StaticLoadObject not resolved");
-		return;
-	}
-
-	for (auto &r : g_replacements) {
-		if (r.cached_obj)
-			continue;
-		r.cached_obj = load_one(r);
-		if (r.cached_obj)
-			log_info("mod_loader: preloaded '%ls' -> %p", r.repl_path_w.c_str(),
-			         r.cached_obj);
-		else
-			log_err("mod_loader: StaticLoadObject failed for '%ls'",
-			        r.repl_path_w.c_str());
-	}
-}
-
-void *find_replacement(FName name) {
+void *find_replacement(FName name, void *outer, void *hook_cls) {
 	if (name.Index == 0 || g_replacements.empty())
+		return nullptr;
+
+	thread_local bool s_in_find = false;
+	if (s_in_find)
 		return nullptr;
 
 	for (auto &r : g_replacements) {
 		if (r.orig_name.Index == 0) {
-			std::wstring wn = to_wide(r.orig_obj);
-			r.orig_name = fname_find(wn.c_str());
+			r.orig_name = fname_create(to_wide(r.orig_obj).c_str());
 			if (r.orig_name.Index == 0)
 				continue;
 		}
+
 		if (r.orig_name.Index != name.Index)
 			continue;
 
@@ -142,31 +186,29 @@ void *find_replacement(FName name) {
 			std::lock_guard<std::mutex> lk(g_load_mtx);
 			if (r.cached_obj)
 				return r.cached_obj;
-			r.cached_obj = load_one(r);
-			if (r.cached_obj)
-				log_info("mod_loader: lazy-loaded '%ls' -> %p",
-				         r.repl_path_w.c_str(), r.cached_obj);
-			else
-				log_err("mod_loader: lazy StaticLoadObject failed for '%ls'",
-				        r.repl_path_w.c_str());
+
+			s_in_find = true;
+			r.cached_obj = load_one(r, outer, hook_cls);
+			s_in_find = false;
 		}
+
 		return r.cached_obj;
 	}
 	return nullptr;
 }
 
 std::wstring find_mod_pkg_path(const wchar_t *pkg_name) {
-	std::string stem;
+	std::string needle;
 	for (const wchar_t *p = pkg_name; *p; ++p)
-		stem += static_cast<char>(towlower(*p));
+		needle += static_cast<char>(towlower(*p));
 
 	for (const auto &r : g_replacements) {
 		if (r.mod_upk_w.empty())
 			continue;
-		std::string s = fs::path(r.mod_upk_w).stem().string();
-		for (auto &c : s)
+		std::string stem = fs::path(r.mod_upk_w).stem().string();
+		for (auto &c : stem)
 			c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-		if (s == stem)
+		if (stem == needle)
 			return r.mod_upk_w;
 	}
 	return {};

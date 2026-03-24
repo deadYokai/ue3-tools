@@ -23,9 +23,7 @@ void init(const std::wstring &exe_dir) {
 
 	std::string dir = to_narrow(exe_dir);
 	char name[MAX_PATH * 4]{};
-	snprintf(name, sizeof(name), "%s\\dinput8_%04d%02d%02d_%02d%02d%02d.log",
-	         dir.c_str(), (int)st.wYear, (int)st.wMonth, (int)st.wDay,
-	         (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
+	snprintf(name, sizeof(name), "%s\\dinput8.log", dir.c_str());
 
 	auto *lg = new Logger();
 	lg->file.open(name, std::ios::trunc | std::ios::out);
@@ -37,7 +35,6 @@ void init(const std::wstring &exe_dir) {
 	g_logger = lg;
 
 	char hdr[512];
-	snprintf(hdr, sizeof(hdr), "====\nLog: %s\n====\n", name);
 	raw_write(hdr);
 }
 
@@ -52,11 +49,8 @@ void raw_write(const char *s) {
 void write_line(const char *level, const char *msg) {
 	if (!g_logger || !g_logger->file.is_open())
 		return;
-	DWORD elapsed = GetTickCount() - g_logger->start_tick;
-	DWORD tid = GetCurrentThreadId();
 	char line[4096];
-	snprintf(line, sizeof(line), "[%08lu][TID:%04lX] %s %s\n",
-	         (unsigned long)elapsed, (unsigned long)tid, level, msg);
+	snprintf(line, sizeof(line), "[%s] %s\n", level, msg);
 	std::lock_guard<std::mutex> lk(g_logger->mtx);
 	g_logger->file << line;
 	g_logger->file.flush();

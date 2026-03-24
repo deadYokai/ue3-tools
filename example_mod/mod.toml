@@ -4,4 +4,4 @@ replacement = "MyFont"
 
 [[patch.replace]]
 original    = "UI_Loading.ChaletComprime-CologneEighty_PageA"
-replacement = "MyFont_PageA"
+replacement = "MyFont.MyFont_PageA"

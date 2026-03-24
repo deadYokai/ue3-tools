@@ -26,14 +26,11 @@ void install_all() {
 			log_info("hook: [%s] installed at %p", e.name, addr);
 			++ok;
 		} else {
-			log_err("hook: [%s] trampoline_install failed at %p", e.name,
-			        addr);
+			log_err("hook: [%s] trampoline_install failed at %p", e.name, addr);
 			++fail;
 		}
 	}
-	log_info("hook: pattern hooks done — ok=%d fail=%d", ok, fail);
-
-	linker_hook::install_vtable();
+	log_info("hook: done — ok=%d fail=%d", ok, fail);
 }
 
 void remove_all() {

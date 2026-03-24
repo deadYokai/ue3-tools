@@ -9,6 +9,6 @@ void *__fastcall Hooked_StaticFindObjectFast(void *cls, void *outer, FName name,
                                              uint64_t excl);
 
 namespace linker_hook {
-void install_vtable();
+void ensure_vtable_hook();
 void remove_vtable();
 } // namespace linker_hook

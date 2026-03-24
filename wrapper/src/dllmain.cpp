@@ -69,25 +69,18 @@ static DWORD WINAPI init_thread(LPVOID) {
 	         reinterpret_cast<void *>(ue3().StaticLoadObject));
 	log_info("init_thread: GPackageFileCache    = %p",
 	         static_cast<void *>(ue3().GPackageFileCache));
-
-	log_info("init_thread: waiting for GPackageFileCache...");
-	for (DWORD i = 0; i < 30000; ++i) {
-		if (ue3().GPackageFileCache && *ue3().GPackageFileCache)
-			break;
-		Sleep(1);
+	if (ue3().FNameNames) {
+		log_info("init_thread: FNameNames           = %p  (Num=%d)",
+		         static_cast<void *>(ue3().FNameNames), ue3().FNameNames->Num);
+	} else {
+		log_warn("init_thread: FNameNames           = NULL  "
+		         "— discovery log will be silent; "
+		         "FNameInit body scan found no valid Names array");
 	}
-	if (!ue3().GPackageFileCache || !*ue3().GPackageFileCache) {
-		log_err("init_thread: GPackageFileCache never became valid");
-		return 1;
-	}
-
 	log_info("init_thread: installing hooks");
 	hook::install_all();
 
-	log_info("init_thread: preloading mod objects");
-	mod_loader::preload_objects();
-
-	log_info("init_thread: ready");
+	log_info("init_thread: ready — all remaining init is lazy");
 	return 0;
 }
 
@@ -96,7 +89,7 @@ extern "C" BOOL WINAPI DllMain(HMODULE hmod, DWORD reason, LPVOID) {
 	case DLL_PROCESS_ATTACH:
 		DisableThreadLibraryCalls(hmod);
 		logs::init(get_exe_dir());
-		log_info("DLL_PROCESS_ATTACH (%s)",
+		log_info("U3T mod loader (%s build)",
 		         sizeof(void *) == 8 ? "x64" : "x86");
 		log_info("module = %p", static_cast<void *>(hmod));
 		init_dinput8();
@@ -104,7 +97,6 @@ extern "C" BOOL WINAPI DllMain(HMODULE hmod, DWORD reason, LPVOID) {
 		break;
 
 	case DLL_PROCESS_DETACH:
-		log_info("DLL_PROCESS_DETACH");
 		hook::remove_all();
 		if (g_sys_di8) {
 			FreeLibrary(g_sys_di8);

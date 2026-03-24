@@ -3,27 +3,100 @@
 #include "disasm.hpp"
 #include "logs.hpp"
 #include "mod_loader.hpp"
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <psapi.h>
 #include <string>
+#include <unordered_set>
 #include <windows.h>
+
+namespace {
+
+std::unordered_set<int32_t> g_seen_names;
+std::mutex g_seen_mtx;
+
+static std::string build_path(void *outer_obj, FName leaf) {
+	std::string leaf_s = fname_to_string(leaf);
+	if (leaf_s.empty())
+		return {};
+
+	std::string outers[3];
+	int n = 0;
+	void *cur = outer_obj;
+	while (cur && n < 3) {
+		FName fn{};
+		memcpy(&fn, static_cast<uint8_t *>(cur) + UObjectOff::ObjectName,
+		       sizeof(FName));
+		std::string s = fname_to_string(fn);
+		if (s.empty())
+			break;
+		outers[n++] = std::move(s);
+		void *next = nullptr;
+		memcpy(&next, static_cast<uint8_t *>(cur) + UObjectOff::Outer,
+		       sizeof(void *));
+		cur = next;
+	}
+
+	std::string path;
+	for (int i = n - 1; i >= 0; --i) {
+		path += outers[i];
+		path += '.';
+	}
+	path += leaf_s;
+	return path;
+}
+
+static void discovery_log(void *cls, void *outer, FName name) {
+	if (!ue3().FNameNames)
+		return;
+	if (name.Index == 0)
+		return;
+
+	{
+		std::lock_guard<std::mutex> lk(g_seen_mtx);
+		if (!g_seen_names.insert(name.Index).second)
+			return;
+	}
+
+	std::string path = build_path(outer, name);
+	if (path.empty())
+		path = fname_to_string(name);
+	if (path.empty())
+		return;
+
+	std::string cls_name;
+	if (cls) {
+		FName cls_fname{};
+		memcpy(&cls_fname, static_cast<uint8_t *>(cls) + UObjectOff::ObjectName,
+		       sizeof(FName));
+		cls_name = fname_to_string(cls_fname);
+	}
+
+	if (cls_name.empty())
+		log_info("[disc] %s", path.c_str());
+	else
+		log_info("[disc] %s  (%s)", path.c_str(), cls_name.c_str());
+}
+
+} // namespace
 
 TrampolineHook Hook_StaticFindObjectFast{};
 
 void *__fastcall Hooked_StaticFindObjectFast(void *cls, void *outer, FName name,
                                              int bExact, int bAny,
                                              uint64_t excl) {
+	linker_hook::ensure_vtable_hook();
 
-	void *repl = mod_loader::find_replacement(name);
-	if (repl) {
+	// discovery_log(cls, outer, name);
+
+	void *repl = mod_loader::find_replacement(name, outer, cls);
+	if (repl)
 		return repl;
-	}
 
-	void *result = reinterpret_cast<StaticFindObjectFast_fn>(
+	return reinterpret_cast<StaticFindObjectFast_fn>(
 	    Hook_StaticFindObjectFast.trampoline)(cls, outer, name, bExact, bAny,
 	                                          excl);
-
-	return result;
 }
 
 namespace linker_hook {
@@ -31,8 +104,11 @@ namespace {
 
 static FindPackageFile_fn g_orig_fpf = nullptr;
 static void **g_fpf_slot = nullptr;
+static std::atomic<bool> g_installed{false};
+static std::mutex g_install_mtx;
 
 static constexpr int kFPFSlot = 2;
+static constexpr int kVtblScan = 16;
 
 static bool is_readable(const void *addr, size_t size = sizeof(void *)) {
 	if (!addr)
@@ -49,10 +125,8 @@ static bool is_readable(const void *addr, size_t size = sizeof(void *)) {
 	                            PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY;
 	if (!(mbi.Protect & kReadable))
 		return false;
-	const auto region_end =
-	    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-	const auto range_end = reinterpret_cast<uintptr_t>(addr) + size;
-	return range_end <= region_end;
+	return (reinterpret_cast<uintptr_t>(addr) + size) <=
+	       (reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize);
 }
 
 static int __fastcall hook_fpf(void *self, const wchar_t *name, void *guid,
@@ -83,50 +157,32 @@ static bool vtable_write(void **slot, void *fn) {
 	return written == sizeof(fn);
 }
 
-} // namespace
-
-void install_vtable() {
+static bool do_install_vtable() {
 	void **cache = ue3().GPackageFileCache;
-
-	log_info("linker_hook: GPackageFileCache var addr = %p", cache);
-
-	if (!cache || !*cache) {
-		log_warn(
-		    "linker_hook: GPackageFileCache not ready — vtable hook skipped");
-		return;
-	}
+	if (!cache || !*cache)
+		return false;
 
 	void *obj = *cache;
-	log_info("linker_hook: GPackageFileCache object = %p", obj);
+	log_info("linker_hook: GPackageFileCache var=%p  obj=%p", cache, obj);
 
-	if (!is_readable(obj, sizeof(void *))) {
-		log_err("linker_hook: object ptr %p is not readable committed memory — "
-		        "PATTERN_GPackageFileCache_Ref matched the wrong instruction; "
-		        "update the pattern or the RIP displacement",
+	if (!is_readable(obj)) {
+		log_err("linker_hook: GPackageFileCache object %p is not readable "
+		        "— RIP displacement wrong; update PATTERN_GetPackageLinker",
 		        obj);
-		return;
+		return false;
 	}
 
-	auto **vtbl = *reinterpret_cast<void ***>(*cache);
+	auto **vtbl = *reinterpret_cast<void ***>(obj);
 	log_info("linker_hook: vtbl = %p", vtbl);
 
 	if (!is_readable(vtbl, sizeof(void *) * (kFPFSlot + 1))) {
 		log_err("linker_hook: vtbl %p is not readable — "
-		        "object at %p does not look like a FPackageFileCache",
+		        "%p does not look like a FPackageFileCache",
 		        vtbl, obj);
-		return;
+		return false;
 	}
 
-	HMODULE exe = GetModuleHandleW(nullptr);
-	log_info("exe module handle: %p", exe);
-	MODULEINFO mi{};
-	GetModuleInformation(GetCurrentProcess(), exe, &mi, sizeof(mi));
-	log_info("Base: %p, Size: %lu, Entry: %p", mi.lpBaseOfDll,
-	         (unsigned long)mi.SizeOfImage, mi.EntryPoint);
-	constexpr int kFallback = kFPFSlot; // = 3
-	const int slot = find_fpf_vtable_slot(
-	    vtbl, 16, reinterpret_cast<uintptr_t>(mi.lpBaseOfDll),
-	    static_cast<size_t>(mi.SizeOfImage), kFallback);
+	const int slot = kFPFSlot;
 
 	g_fpf_slot = &vtbl[slot];
 	g_orig_fpf = reinterpret_cast<FindPackageFile_fn>(*g_fpf_slot);
@@ -135,11 +191,30 @@ void install_vtable() {
 		log_err("linker_hook: vtable write failed for slot %d", slot);
 		g_fpf_slot = nullptr;
 		g_orig_fpf = nullptr;
-		return;
+		return false;
 	}
 
-	log_info("linker_hook: FindPackageFile vtable hooked (slot=%d orig=%p)",
-	         slot, reinterpret_cast<void *>(g_orig_fpf));
+	log_info("linker_hook: FindPackageFile hooked  slot=%d  orig=%p", slot,
+	         reinterpret_cast<void *>(g_orig_fpf));
+	return true;
+}
+
+} // namespace
+
+void ensure_vtable_hook() {
+	if (g_installed.load(std::memory_order_acquire))
+		return;
+
+	if (!ue3().GPackageFileCache || !*ue3().GPackageFileCache)
+		return;
+
+	std::lock_guard<std::mutex> lk(g_install_mtx);
+	if (g_installed.load(std::memory_order_relaxed))
+		return;
+
+	if (do_install_vtable()) {
+		g_installed.store(true, std::memory_order_release);
+	}
 }
 
 void remove_vtable() {
@@ -148,6 +223,7 @@ void remove_vtable() {
 	vtable_write(g_fpf_slot, reinterpret_cast<void *>(g_orig_fpf));
 	g_fpf_slot = nullptr;
 	g_orig_fpf = nullptr;
+	g_installed.store(false, std::memory_order_release);
 	log_info("linker_hook: FindPackageFile vtable hook removed");
 }
 
