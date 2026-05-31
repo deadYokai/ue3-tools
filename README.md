@@ -1,7 +1,7 @@
 
 # UE3Tools
 
-Just some tools for Unreal3 games  
+Just some tools for Unreal3 game
 Codebase currently based on Dishonored (maybe works in other games).
 
 ## License
@@ -19,23 +19,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Note that the maintainers reserve the ri
 - Converting game localization text to gettext format
 
 ## Support:
-[Visit my site](https://yokai.digital/)
-
-[Patreon](https://www.patreon.com/c/MyNameIsKitsune)
-
-[Monobank](https://send.monobank.ua/jar/9oVcUiHxPd)
+[![MySite](https://img.shields.io/badge/yokai.digital-black?style=for-the-badge)](https://yokai.digital)
+[![Paypal](https://img.shields.io/badge/Paypal-black?style=for-the-badge&logo=paypal)](https://www.paypal.com/donate/?hosted_button_id=RLGYGXH4LZ8PC)
+[![Monobank](https://img.shields.io/badge/Monobank-black?style=for-the-badge)](https://send.monobank.ua/jar/9oVcUiHxPd)
+[![Liberapay](https://img.shields.io/liberapay/receives/deadYokai.svg?logo=liberapay&style=for-the-badge&logoColor=white&labelColor=black&color=orange&label=Liberapay)](https://liberapay.com/deadYokai/donate)
 
 ---
 
-[Stand For Ukraine](https://standforukraine.com/)
+[![Stand For Ukraine](https://img.shields.io/badge/Stand_For_Ukraine-find_a_charity-blue?style=for-the-badge)](https://standforukraine.com/)
 
-[Sternenko Fund](https://www.sternenkofund.org/en/)
-
-
-## Contact me:
-#### Warning: i'm introvert, scary talk to peoples
-
-Signal             |  Discord
-:-------------------------:|:-------------------------:
-[![Signal](https://passionclass-prod-s3.fra1.cdn.digitaloceanspaces.com/images_shrunk/Signal.png)](https://signal.me/#eu/pp79dS8UzcQONIWgWmYEOuBFy6Ql5Di3oz3ravkfS5d32K37nWVCA4-qR1sh-kBA) | [![Discord Server (UA)](https://cdn3.iconfinder.com/data/icons/social-network-flat-3/100/Discord-64.png)](https://discord.gg/A3jtZHQqby)
 
