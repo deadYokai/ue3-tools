@@ -13,6 +13,8 @@ use std::{
 use self::upkfont::create_font_blobs;
 
 mod mod_engine;
+mod schema;
+mod schemadb;
 mod scriptcompiler;
 mod scriptdisasm;
 mod scriptpatcher;
@@ -21,6 +23,7 @@ mod upkfont;
 mod upkpacker;
 mod upkprops;
 mod upkreader;
+mod versions;
 
 fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeader)> {
     let path = Path::new(path);
@@ -33,82 +36,73 @@ fn upk_header_cursor(path: &str) -> Result<(Cursor<Vec<u8>>, upkreader::UpkHeade
     let header = UpkHeader::read(&mut reader)?;
     println!("{}", header);
 
-    let end_header_offest = reader.stream_position()? as usize;
-
-    if header.compression_method != CompressionMethod::None {
-        if header.compressed_chunks_count != 0 {
-            println!("File is compressed, trying decompress...");
-
-            let mut cloned_header = header.clone();
-            cloned_header.compression_method = CompressionMethod::None;
-            cloned_header.compressed_chunks_count = 0;
-            cloned_header.pak_flags = header.pak_flags & !PackageFlags::StoreCompressed.bits();
-
-            let mut chunks = header.compressed_chunks;
-
-            chunks.sort_by_key(|c| c.decompressed_offset);
-
-            let first_chunk_offset = chunks[0].compressed_offset as usize;
-
-            let dec_data = upk_decompress(&mut reader, header.compression_method, &chunks)
-                .expect("Decompression error");
-
-            let file = File::create(".tmp.upk")?;
-            let mut writer = BufWriter::new(file);
-
-            cloned_header.write(&mut writer)?;
-
-            //
-            // println!("{:?} {:?}", first_chunk_offset, end_header_offest);
-            // // TODO: hmm, 4 zerobytes, need find what it is
-            //
-            // if first_chunk_offset > end_header_offest {
-            //     let pre_data_len = first_chunk_offset - end_header_offest - (chunks.len() * 16);
-            //     reader.seek(SeekFrom::Start((end_header_offest + (chunks.len() * 16)) as u64))?;
-            //     let mut pre_data = vec![0u8; pre_data_len];
-            //     reader.read_exact(&mut pre_data)?;
-            //     writer.write_all(&pre_data)?;
-            // }
-            //
-            for (i, c) in dec_data.iter().enumerate() {
-                if i != 0 {
-                    let prev = chunks[i - 1].compressed_offset + chunks[i - 1].compressed_size;
-
-                    let diff = chunks[i].compressed_offset - prev;
-
-                    if diff > 0 {
-                        reader.seek(SeekFrom::Start(prev as u64))?;
-                        let mut data = vec![0u8; diff as usize];
-                        reader.read_exact(&mut data)?;
-                        writer.write_all(&data)?;
-                    }
-                }
-                writer.seek(SeekFrom::Start(chunks[i].decompressed_offset as u64))?;
-                writer.write_all(c)?;
-            }
-
-            let last = chunks[chunks.len() - 1].compressed_offset
-                + chunks[chunks.len() - 1].compressed_size;
-
-            if filesize > last as u64 {
-                reader.seek(SeekFrom::Start(last as u64))?;
-                let mut data = vec![0u8; (filesize - last as u64) as usize];
-                reader.read_exact(&mut data)?;
-                writer.write_all(&data)?;
-            }
-        }
-
-        println!("File is decompressed. Reopening file");
-
-        fs::remove_file(path)?;
-        fs::rename(".tmp.upk", path)?;
-        return upk_header_cursor(path.to_str().unwrap());
+    if header.compression_method == CompressionMethod::None || header.compressed_chunks_count == 0 {
+        reader.seek(SeekFrom::Start(0))?;
+        let mut buf = Vec::with_capacity(filesize as usize);
+        reader.read_to_end(&mut buf)?;
+        return Ok((Cursor::new(buf), header));
     }
 
-    reader.seek(SeekFrom::Start(0))?;
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf)?;
-    Ok((Cursor::new(buf), header))
+    println!("File is compressed, decompressing in memory...");
+
+    let mut cloned_header = header.clone();
+    cloned_header.compression_method = CompressionMethod::None;
+    cloned_header.compressed_chunks_count = 0;
+    cloned_header.compressed_chunks.clear();
+    cloned_header.pak_flags = header.pak_flags & !upkreader::PackageFlags::StoreCompressed.bits();
+
+    let mut chunks = header.compressed_chunks.clone();
+    chunks.sort_by_key(|c| c.decompressed_offset);
+
+    let dec_data = upk_decompress(&mut reader, header.compression_method, &chunks)
+        .expect("Decompression error");
+
+    let dec_total = chunks
+        .iter()
+        .zip(dec_data.iter())
+        .map(|(c, d)| c.decompressed_offset as usize + d.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(dec_total.max(filesize as usize));
+    {
+        let mut w = std::io::Cursor::new(&mut buf);
+        cloned_header.write(&mut w)?;
+    }
+
+    for (i, dec) in dec_data.iter().enumerate() {
+        if i != 0 {
+            let prev = chunks[i - 1].compressed_offset + chunks[i - 1].compressed_size;
+            let gap = chunks[i].compressed_offset.saturating_sub(prev);
+            if gap > 0 {
+                reader.seek(SeekFrom::Start(prev as u64))?;
+                let mut gap_buf = vec![0u8; gap as usize];
+                reader.read_exact(&mut gap_buf)?;
+                buf.extend_from_slice(&gap_buf);
+            }
+        }
+        let target = chunks[i].decompressed_offset as usize;
+        if buf.len() < target {
+            buf.resize(target, 0);
+        } else if buf.len() > target {
+            buf[target..target + dec.len()].copy_from_slice(dec);
+            continue;
+        }
+        buf.extend_from_slice(dec);
+    }
+
+    let last_compressed_end = chunks
+        .last()
+        .map(|c| (c.compressed_offset + c.compressed_size) as u64)
+        .unwrap_or(0);
+    if filesize > last_compressed_end {
+        reader.seek(SeekFrom::Start(last_compressed_end))?;
+        let mut tail = Vec::with_capacity((filesize - last_compressed_end) as usize);
+        reader.read_to_end(&mut tail)?;
+        buf.extend_from_slice(&tail);
+    }
+
+    Ok((Cursor::new(buf), cloned_header))
 }
 
 fn getlist(path: &str) -> Result<()> {
@@ -147,7 +141,14 @@ fn dump_names(upk_path: &str, mut output_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> Result<()> {
+fn extract_file(
+    upk_path: &str,
+    path: &str,
+    mut output_dir: &str,
+    all: bool,
+    game_root: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
     if output_dir.is_empty() {
         output_dir = "output";
     }
@@ -159,28 +160,42 @@ fn extract_file(upk_path: &str, path: &str, mut output_dir: &str, all: bool) -> 
     let pbuf = output_dir_path.join(filename);
     let dir_path: &Path = pbuf.as_path();
 
-    let (mut cursor, header): (Cursor<Vec<u8>>, upkreader::UpkHeader) =
-        upk_header_cursor(upk_path)?;
-    let mut cur: Cursor<&Vec<u8>> = Cursor::new(cursor.get_ref());
+    let (mut cursor, header) = upk_header_cursor(upk_path)?;
+    let mut cur = Cursor::new(cursor.get_ref());
     let up = UPKPak::parse_upk(&mut cur, &header)?;
 
     if !dir_path.exists() {
         std::fs::create_dir_all(dir_path)?;
     }
 
-    let mut data_file = File::create(pbuf.with_extension("ron"))?;
+    let db = match game_root {
+        Some(gr) if !gr.is_empty() => {
+            let db = schemadb::SchemaDb::new(Path::new(gr))?.with_verbose(verbose);
+            let stem_lc = filename.to_string_lossy().to_lowercase();
+            let lp = std::rc::Rc::new(schemadb::LazyPackage {
+                stem_lc: stem_lc.clone(),
+                path: Path::new(upk_path).to_path_buf(),
+                bytes: cursor.get_ref().clone(),
+                header: header.clone(),
+                pak: up.clone(),
+            });
+            db.inject_package(lp);
+            Some(db)
+        }
+        _ => None,
+    };
 
-    let config = PrettyConfig::new().struct_names(true);
-
-    let tup = (&filename.to_str().unwrap(), &upk_path, &header, &up);
-    let s = to_string_pretty(&tup, config).expect("Fail");
-    writeln!(data_file, "{s}")?;
-
-    // let s = to_string_pretty(&up, pretty).expect("Fail");
-    // writeln!(data_file, "{s}")?;
-
-    upkreader::extract_by_name(&mut cursor, &up, path, dir_path, all, header.p_ver)?;
-
+    let stem_lc = filename.to_string_lossy().to_lowercase();
+    upkreader::extract_by_name(
+        &mut cursor,
+        &up,
+        path,
+        dir_path,
+        all,
+        header.p_ver,
+        db.as_ref(),
+        &stem_lc,
+    )?;
     Ok(())
 }
 
@@ -377,6 +392,10 @@ fn print_obj_elements(ron_path: &str, path: &str) -> Result<()> {
 #[command(name = "ue3-tools")]
 #[command(about = "Unreal3 upk stuff")]
 struct Cli {
+    #[arg(long, global = true)]
+    game_root: Option<String>,
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -550,6 +569,65 @@ enum Commands {
         #[arg(long, default_value = "dist")]
         out: String,
     },
+
+    #[command(about = "Dump the meta-object schema for every export in a UPK")]
+    SchemaDump {
+        upk_path: String,
+        #[arg(long)]
+        class_filter: Option<String>,
+    },
+
+    #[command(about = "resolve a full path through the schema DB")]
+    SchemaResolve {
+        starting_pkg: String,
+        full_path: String,
+    },
+}
+
+fn schema_resolve(starting: &str, full_path: &str, game_root: &str, verbose: bool) -> Result<()> {
+    use crate::schemadb::SchemaDb;
+    use std::path::Path;
+
+    let db = SchemaDb::new(Path::new(game_root))?.with_verbose(verbose);
+    println!(
+        "Indexed {} package(s), {} TFC(s) under {}",
+        db.known_package_count(),
+        db.tfc_index.len(),
+        game_root
+    );
+
+    let r = db.resolve_full_path(starting, full_path)?;
+    let r = match r {
+        Some(r) => r,
+        None => {
+            println!("Resolution failed:");
+            for m in db.misses.borrow().iter() {
+                println!("  {m}");
+            }
+            return Ok(());
+        }
+    };
+    println!("\nResolved: {}", r.display());
+    let entry = db.entry(&r)?;
+    println!("  entry: {}", summarize_entry(&entry));
+
+    println!("\nClass chain:");
+    let chain = db.class_chain(&r)?;
+    for (i, link) in chain.iter().enumerate() {
+        let name = db.export_object_name(link).unwrap_or_else(|| "?".into());
+        println!("  {:2}. {}  ({})", i, name, link.display());
+    }
+
+    println!("\nDirect children:");
+    for (name, cref, entry) in db.list_children(&r)? {
+        println!(
+            "  {:24}  {}  ({})",
+            name,
+            summarize_entry(&entry),
+            cref.display()
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -573,14 +651,28 @@ fn main() -> Result<()> {
             output_dir,
         } => {
             let out = output_dir.as_deref().unwrap_or("");
-            extract_file(&upk_path, &path, out, false)?
+            extract_file(
+                &upk_path,
+                &path,
+                out,
+                false,
+                cli.game_root.as_deref(),
+                cli.verbose,
+            )?
         }
         Commands::Extractall {
             upk_path,
             output_dir,
         } => {
             let out = output_dir.as_deref().unwrap_or("");
-            extract_file(&upk_path, "", out, true)?
+            extract_file(
+                &upk_path,
+                "",
+                out,
+                true,
+                cli.game_root.as_deref(),
+                cli.verbose,
+            )?
         }
         Commands::Pack { .. } => unimplemented!(),
         Commands::MakeScriptPatch {
@@ -709,9 +801,144 @@ fn main() -> Result<()> {
             };
             mod_engine::cmd_pack(mod_path, &dist_path)?;
         }
+        Commands::SchemaDump {
+            upk_path,
+            class_filter,
+        } => {
+            schema_dump(&upk_path, class_filter.as_deref())?;
+        }
+        Commands::SchemaResolve {
+            starting_pkg,
+            full_path,
+        } => {
+            let gr = cli.game_root.as_deref().unwrap_or("");
+            if gr.is_empty() {
+                eprintln!("--game-root required for schema-resolve");
+                std::process::exit(1);
+            }
+            schema_resolve(&starting_pkg, &full_path, gr, cli.verbose)?;
+        }
     }
 
     Ok(())
+}
+
+fn schema_dump(upk_path: &str, class_filter: Option<&str>) -> Result<()> {
+    use crate::schema::{SchemaParseCtx, parse_export_schema};
+
+    let (mut cursor, header) = upk_header_cursor(upk_path)?;
+    let mut cur = Cursor::new(cursor.get_ref());
+    let pak = UPKPak::parse_upk(&mut cur, &header)?;
+
+    let ctx = SchemaParseCtx {
+        p_ver: header.p_ver,
+        strip_editor_only: header.strip_editor_only(),
+    };
+
+    println!(
+        "Parsing schema (p_ver={}, strip_editor_only={})",
+        ctx.p_ver, ctx.strip_editor_only
+    );
+
+    let mut ok = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for (idx, exp) in pak.export_table.iter().enumerate() {
+        let class_name = pak.get_class_name(exp.class_index);
+        if let Some(f) = class_filter {
+            if !class_name.contains(f) {
+                continue;
+            }
+        }
+
+        cursor.seek(SeekFrom::Start(exp.serial_offset as u64))?;
+        let mut blob = vec![0u8; exp.serial_size as usize];
+        cursor.read_exact(&mut blob)?;
+
+        let full_name = pak.get_export_full_name((idx + 1) as i32);
+        match parse_export_schema(&blob, &class_name, &pak, ctx) {
+            Ok(Some(entry)) => {
+                ok += 1;
+                println!(
+                    "#{:5} {}  →  {}",
+                    idx + 1,
+                    full_name,
+                    summarize_entry(&entry)
+                );
+            }
+            Ok(None) => {
+                skipped += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("#{:5} {}  →  parse error: {}", idx + 1, full_name, e);
+            }
+        }
+    }
+
+    println!(
+        "\nSummary: {} parsed, {} skipped (non-meta), {} failed",
+        ok, skipped, failed
+    );
+    Ok(())
+}
+
+fn summarize_entry(e: &crate::schema::SchemaEntry) -> String {
+    use crate::schema::SchemaEntry::*;
+    match e {
+        Class {
+            header,
+            class_flags,
+            class_default_object,
+            ..
+        } => format!(
+            "Class super={} children=0x{:x} cdo={} flags=0x{:08x}",
+            header.super_struct, header.children, class_default_object, class_flags
+        ),
+        State {
+            header,
+            state_flags,
+            ..
+        } => format!(
+            "State super={} children=0x{:x} flags=0x{:08x}",
+            header.super_struct, header.children, state_flags
+        ),
+        ScriptStruct {
+            header,
+            struct_flags,
+        } => format!(
+            "ScriptStruct super={} children=0x{:x} flags=0x{:08x}",
+            header.super_struct, header.children, struct_flags
+        ),
+        Struct { header } => format!(
+            "Struct super={} children=0x{:x}",
+            header.super_struct, header.children
+        ),
+        Function {
+            header,
+            function_flags,
+            i_native,
+            ..
+        } => format!(
+            "Function super={} children=0x{:x} iNative={} flags=0x{:08x} script={}B",
+            header.super_struct,
+            header.children,
+            i_native,
+            function_flags,
+            header.on_disk_script_size
+        ),
+        Enum { names, .. } => format!("Enum [{}]", names.len()),
+        Property(p) => {
+            let c = p.common();
+            format!(
+                "{:?} dim={} flags=0x{:016x}",
+                std::mem::discriminant(p),
+                c.array_dim,
+                c.property_flags
+            )
+        }
+    }
 }
 
 fn make_font_patch_cmd(

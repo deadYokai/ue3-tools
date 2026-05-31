@@ -1,91 +1,69 @@
-use std::io::{Cursor, Read, Result, Seek, SeekFrom, Write};
+use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 
-use crate::upkreader::{read_string, FName, UPKPak};
+use crate::{
+    schema::{PropertyKind, SchemaEntry},
+    schemadb::{ResolvedRef, SchemaDb},
+    upkreader::{FName, UPKPak, read_string, write_fstring},
+    versions::{
+        VER_BYTEPROP_SERIALIZE_ENUM as V_BYTE_ENUM, VER_PROPERTYTAG_BOOL_OPTIMIZATION as V_BOOL_OPT,
+    },
+};
 
-pub const VER_BYTEPROP_SERIALIZE_ENUM: i16 = 633;
-pub const VER_PROPERTYTAG_BOOL_OPTIMIZATION: i16 = 673;
+fn is_builtin_atomic(name: &str) -> bool {
+    matches!(
+        name,
+        "Vector"
+            | "Vector2D"
+            | "Vector4"
+            | "Quat"
+            | "Rotator"
+            | "Color"
+            | "LinearColor"
+            | "Box"
+            | "Box2D"
+            | "BoxSphereBounds"
+            | "Matrix"
+            | "Plane"
+            | "Sphere"
+            | "Guid"
+            | "IntPoint"
+            | "TwoVectors"
+            | "InterpCurvePointFloat"
+            | "InterpCurvePointVector"
+            | "InterpCurvePointVector2D"
+            | "InterpCurvePointTwoVectors"
+            | "InterpCurvePointQuat"
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub enum PropertyValue {
     None,
     Byte(u8),
     Int(i32),
     Bool(bool),
     Float(f32),
+
     Object(i32),
+
+    ObjectRef(String),
     Name(FName),
+
+    EnumLabel(String),
     String(String),
     Array(Vec<PropertyValue>),
-    Struct(Vec<(String, PropertyValue)>),
+
+    Struct(Vec<Property>),
+
+    AtomicStruct(Vec<(String, PropertyValue)>),
+
     Raw(Vec<u8>),
 }
 
-trait IntoArrayOrRaw {
-    fn into_array_or_raw(self) -> PropertyValue;
-}
-
-impl IntoArrayOrRaw for PropertyValue {
-    fn into_array_or_raw(self) -> PropertyValue { self }
-}
-
-impl PropertyValue {
-    pub fn as_vec(&self) -> Option<&Vec<PropertyValue>> {
-        if let PropertyValue::Array(a) = self {
-            Some(a)
-        } else {
-            None
-        }
-    }
-
-    pub fn as_byte(&self) -> Option<u8> {
-        if let PropertyValue::Byte(b) = self {
-            Some(*b)
-        } else {
-            None
-        }
-    }
-
-    pub fn write_all<W: Write>(&self, writer: &mut W) -> Result<()> {
-        match self {
-            PropertyValue::None => unreachable!(),
-            PropertyValue::Byte(b) => writer.write_all(&[*b])?,
-            PropertyValue::Int(i) => writer.write_all(&i.to_le_bytes())?,
-            PropertyValue::Bool(b) => writer.write_all(&[if *b {1u8} else {0u8}])?,
-            PropertyValue::Float(f) => writer.write_all(&f.to_le_bytes())?,
-            PropertyValue::Object(id) => writer.write_all(&id.to_le_bytes())?,
-            PropertyValue::Raw(data) => writer.write_all(data)?,
-            PropertyValue::Name(fname) => {
-                writer.write_all(&fname.name_index.to_le_bytes())?;
-                writer.write_all(&fname.name_instance.to_le_bytes())?;
-            },
-            PropertyValue::String(_) => {
-                todo!();
-            },
-            PropertyValue::Array(arr) => {
-                writer.write_all(&(arr.len() as i32).to_le_bytes())?;
-                for el in arr { el.write_all(writer)?; }
-            },
-            PropertyValue::Struct(fields) => {
-                for (_, v) in fields { v.write_all(writer)?; }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        self.write_all(&mut buf).expect("");
-        buf
-    }
-
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Property {
     pub name: String,
     pub prop_type: String,
@@ -96,404 +74,293 @@ pub struct Property {
     pub struct_name: Option<String>,
 }
 
-impl Property {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        todo!()
+#[derive(Clone)]
+pub struct PropertyCtx<'a> {
+    pub pak: &'a UPKPak,
+    pub ver: i16,
+    pub db: Option<&'a SchemaDb>,
+    pub owner: Option<ResolvedRef>,
+}
+
+impl<'a> PropertyCtx<'a> {
+    pub fn legacy(pak: &'a UPKPak, ver: i16) -> Self {
+        Self {
+            pak,
+            ver,
+            db: None,
+            owner: None,
+        }
+    }
+    pub fn with_owner(&self, owner: ResolvedRef) -> Self {
+        let mut c = self.clone();
+        c.owner = Some(owner);
+        c
+    }
+    pub fn drop_owner(&self) -> Self {
+        let mut c = self.clone();
+        c.owner = None;
+        c
     }
 }
 
-fn read_fname(reader: &mut Cursor<&Vec<u8>>) -> Result<FName> {
+fn read_fname(r: &mut Cursor<&Vec<u8>>) -> Result<FName> {
     Ok(FName {
-        name_index: reader.read_i32::<LittleEndian>()?,
-        name_instance: reader.read_i32::<LittleEndian>()?
+        name_index: r.read_i32::<LittleEndian>()?,
+        name_instance: r.read_i32::<LittleEndian>()?,
     })
 }
 
-fn resolve_fname(fname: &FName, pak: &UPKPak) -> Option<String> {
-    let name = pak.name_table.get(fname.name_index as usize)?;
-    if fname.name_instance > 0 {
-        Some(format!("{}_{}", name, fname.name_instance - 1))
+fn write_fname<W: Write>(w: &mut W, f: &FName) -> Result<()> {
+    w.write_i32::<LittleEndian>(f.name_index)?;
+    w.write_i32::<LittleEndian>(f.name_instance)?;
+    Ok(())
+}
+
+fn resolve_fname(f: &FName, pak: &UPKPak) -> Option<String> {
+    let n = pak.name_table.get(f.name_index as usize)?;
+    if f.name_instance > 0 {
+        Some(format!("{}_{}", n, f.name_instance - 1))
     } else {
-        Some(name.clone())
+        Some(n.clone())
     }
 }
 
-pub fn parse_array(
-    reader: &mut Cursor<&Vec<u8>>,
-    pak: &UPKPak,
-    size: i32,
-    ver: i16
-) -> Result<PropertyValue> {    
-    let start_pos = reader.position();
-    let count = reader.read_i32::<LittleEndian>()?;
-
-    if count < 0 {
-        eprintln!("Invalid array count: {}", count);
-        return Ok(PropertyValue::Array(Vec::new()));
-    }
-
-    if count == 0 { 
-        return Ok(PropertyValue::Array(Vec::new()));
-    }
-
-    if count > 1_000_000 {
-        eprintln!("Warning: Very large array count: {}", count);
-        let skip = (size as i64) - 4;
-        if skip > 0 { reader.seek(SeekFrom::Current(skip))?; }
-        return Ok(PropertyValue::Array(vec![]));
-    }
-
-    let data_bytes = (size as u64).saturating_sub(4);
-    if data_bytes == 0 {
-        return Ok(PropertyValue::Array(vec![]));
-    }
-
-    if data_bytes % count as u64 != 0 {
-        eprintln!("warn: array data_bytes={data_bytes} not divisible by count={count}");
-        let mut buf = vec![0u8; data_bytes as usize];
-        reader.read_exact(&mut buf)?;
-        return Ok(PropertyValue::Raw(buf).into_array_or_raw());
-    }
-
-    let elem_size = data_bytes / count as u64;
-    let mut elements = Vec::with_capacity(count as usize);
-
-    match elem_size {
-        1 => {
-            for _ in 0..count {
-                let val = reader.read_u8()?;
-                elements.push(PropertyValue::Byte(val));
-            }
-        }
-        4 => {
-            let pos0 = reader.position();
-            let raw = reader.read_i32::<LittleEndian>()?;
-            reader.seek(SeekFrom::Start(pos0))?;
-
-            let is_obj = raw < 0 || (raw > 0 && raw < 65536);
-            let as_f   = f32::from_bits(raw as u32);
-            let is_flt = !is_obj && as_f.is_finite() && as_f.abs() < 1e10;
-            for _ in 0..count {
-                elements.push(if is_obj {
-                    PropertyValue::Object(reader.read_i32::<LittleEndian>()?)
-                } else if is_flt {
-                    PropertyValue::Float(reader.read_f32::<LittleEndian>()?)
-                } else {
-                    PropertyValue::Int(reader.read_i32::<LittleEndian>()?)
-                });
-            }
-        }
-        8 => {
-            for _ in 0..count {
-                let fname = read_fname(reader)?;
-                elements.push(PropertyValue::Name(fname));
-            }
-        }
-        12 => {
-            let pos0 = reader.position();
-            let raw  = reader.read_u32::<LittleEndian>()?;
-            reader.seek(SeekFrom::Start(pos0))?;
-            let is_flt = f32::from_bits(raw).is_finite();
-
-            for _ in 0..count {
-                let (x_raw, y_raw, z_raw) = (
-                    reader.read_u32::<LittleEndian>()?,
-                    reader.read_u32::<LittleEndian>()?,
-                    reader.read_u32::<LittleEndian>()?,
-                );
-                elements.push(PropertyValue::Struct(if is_flt {
-                    vec![
-                        ("X".into(), PropertyValue::Float(f32::from_bits(x_raw))),
-                        ("Y".into(), PropertyValue::Float(f32::from_bits(y_raw))),
-                        ("Z".into(), PropertyValue::Float(f32::from_bits(z_raw))),
-                    ]
-                } else {
-                    vec![
-                        ("Pitch".into(), PropertyValue::Int(x_raw as i32)),
-                        ("Yaw".into(),   PropertyValue::Int(y_raw as i32)),
-                        ("Roll".into(),  PropertyValue::Int(z_raw as i32)),
-                    ]
-                }));
-            }
-        }
-        16 => {
-            for _ in 0..count {
-                let a = reader.read_u32::<LittleEndian>()?;
-                let b = reader.read_u32::<LittleEndian>()?;
-                let c = reader.read_u32::<LittleEndian>()?;
-                let d = reader.read_u32::<LittleEndian>()?;
-                let as_f = f32::from_bits(a);
-                let fields = if as_f.is_finite() {
-                    vec![
-                        ("X".into(), PropertyValue::Float(f32::from_bits(a))),
-                        ("Y".into(), PropertyValue::Float(f32::from_bits(b))),
-                        ("Z".into(), PropertyValue::Float(f32::from_bits(c))),
-                        ("W".into(), PropertyValue::Float(f32::from_bits(d))),
-                    ]
-                } else {
-                    vec![
-                        ("A".into(), PropertyValue::Int(a as i32)),
-                        ("B".into(), PropertyValue::Int(b as i32)),
-                        ("C".into(), PropertyValue::Int(c as i32)),
-                        ("D".into(), PropertyValue::Int(d as i32)),
-                    ]
-                };
-                elements.push(PropertyValue::Struct(fields));
-            }
-        }
-        _ => {
-            let start_pos = reader.position();
-            let total_end = start_pos + data_bytes;
-
-            let mut parsed_as_structs = false;
-
-            {
-                let probe_start = reader.position();
-                let probe_end   = probe_start + elem_size;
-                let mut ok = true;
-                let mut probe_fields: Vec<(String, PropertyValue)> = Vec::new();
-
-                loop {
-                    if reader.position() >= probe_end { break; }
-                    match parse_property(reader, pak, ver) {
-                        Ok(Some(p)) if p.name == "None" => break,
-                        Ok(Some(p)) => probe_fields.push((p.name.clone(), p.value)),
-                        _ => { ok = false; break; }
-                    }
-                }
-
-                if ok {
-                    reader.seek(SeekFrom::Start(probe_start))?;
-                    parsed_as_structs = true;
-                } else {
-                    reader.seek(SeekFrom::Start(probe_start))?;
-                }
-            }
-
-            if parsed_as_structs {
-                for _ in 0..count {
-                    let elem_end = reader.position() + elem_size;
-                    let mut fields = Vec::new();
-                    loop {
-                        if reader.position() >= elem_end { break; }
-                        match parse_property(reader, pak, ver)? {
-                            Some(p) if p.name == "None" => break,
-                            Some(p) => fields.push((p.name.clone(), p.value)),
-                            None    => break,
-                        }
-                    }
-                    if reader.position() < elem_end {
-                        reader.seek(SeekFrom::Start(elem_end))?;
-                    }
-                    elements.push(PropertyValue::Struct(fields));
-                }
-            } else {
-                for _ in 0..count {
-                    let mut buf = vec![0u8; elem_size as usize];
-                    reader.read_exact(&mut buf)?;
-                    elements.push(PropertyValue::Raw(buf));
-                }
-            }
-
-        }
-    }
-
-    Ok(PropertyValue::Array(elements))
+fn find_name(pak: &UPKPak, name: &str) -> Result<i32> {
+    pak.name_table
+        .iter()
+        .position(|n| n == name)
+        .map(|i| i as i32)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("name '{name}' not in package name table (Phase 4 will append)"),
+            )
+        })
 }
 
-pub fn parse_struct(
-    r: &mut Cursor<&Vec<u8>>,
-    pak: &UPKPak,
-    size: i32,
-    struct_name: &str,
-    ver: i16
-) -> Result<PropertyValue> {
-    match struct_name {
-        "Guid" => {
-            let mut f = Vec::with_capacity(4);
-            for lbl in &["A","B","C","D"] {
-                let v = r.read_u32::<LittleEndian>()?;
-                f.push((lbl.to_string(), PropertyValue::Int(v as i32)));
-            }
-            Ok(PropertyValue::Struct(f))
+impl PropertyValue {
+    pub fn as_vec(&self) -> Option<&Vec<PropertyValue>> {
+        if let PropertyValue::Array(a) = self {
+            Some(a)
+        } else {
+            None
         }
-        "Vector" => {
-            let x = r.read_f32::<LittleEndian>()?;
-            let y = r.read_f32::<LittleEndian>()?;
-            let z = r.read_f32::<LittleEndian>()?;
-            Ok(PropertyValue::Struct(vec![
-                ("X".into(), PropertyValue::Float(x)),
-                ("Y".into(), PropertyValue::Float(y)),
-                ("Z".into(), PropertyValue::Float(z)),
-            ]))
+    }
+    pub fn as_byte(&self) -> Option<u8> {
+        if let PropertyValue::Byte(b) = self {
+            Some(*b)
+        } else {
+            None
         }
-        "Vector2D" => {
-            let x = r.read_f32::<LittleEndian>()?;
-            let y = r.read_f32::<LittleEndian>()?;
-            Ok(PropertyValue::Struct(vec![
-                ("X".into(), PropertyValue::Float(x)),
-                ("Y".into(), PropertyValue::Float(y)),
-            ]))
-        }
-        "Vector4" | "Quat" => {
-            let mut f = Vec::with_capacity(4);
-            for lbl in &["X","Y","Z","W"] {
-                f.push((lbl.to_string(), PropertyValue::Float(r.read_f32::<LittleEndian>()?)));
-            }
-            Ok(PropertyValue::Struct(f))
-        }
-        "Rotator" => {
-            Ok(PropertyValue::Struct(vec![
-                ("Pitch".into(), PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
-                ("Yaw".into(),   PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
-                ("Roll".into(),  PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
-            ]))
-        }
-        "Color" => {
-            Ok(PropertyValue::Struct(vec![
-                ("B".into(), PropertyValue::Byte(r.read_u8()?)),
-                ("G".into(), PropertyValue::Byte(r.read_u8()?)),
-                ("R".into(), PropertyValue::Byte(r.read_u8()?)),
-                ("A".into(), PropertyValue::Byte(r.read_u8()?)),
-            ]))
-        }
-        "LinearColor" => {
-            let mut f = Vec::with_capacity(4);
-            for lbl in &["R","G","B","A"] {
-                f.push((lbl.to_string(), PropertyValue::Float(r.read_f32::<LittleEndian>()?)));
-            }
-            Ok(PropertyValue::Struct(f))
-        }
-        "Box" => {
-            // Min (Vector) + Max (Vector) + IsValid (byte)
-            let min_x = r.read_f32::<LittleEndian>()?;
-            let min_y = r.read_f32::<LittleEndian>()?;
-            let min_z = r.read_f32::<LittleEndian>()?;
-            let max_x = r.read_f32::<LittleEndian>()?;
-            let max_y = r.read_f32::<LittleEndian>()?;
-            let max_z = r.read_f32::<LittleEndian>()?;
-            let valid = r.read_u8()?;
-            Ok(PropertyValue::Struct(vec![
-                ("Min".into(), PropertyValue::Struct(vec![
-                    ("X".into(), PropertyValue::Float(min_x)),
-                    ("Y".into(), PropertyValue::Float(min_y)),
-                    ("Z".into(), PropertyValue::Float(min_z)),
-                ])),
-                ("Max".into(), PropertyValue::Struct(vec![
-                    ("X".into(), PropertyValue::Float(max_x)),
-                    ("Y".into(), PropertyValue::Float(max_y)),
-                    ("Z".into(), PropertyValue::Float(max_z)),
-                ])),
-                ("IsValid".into(), PropertyValue::Byte(valid)),
-            ]))
-        }
-        _ => {
-            let start   = r.position();
-            let end     = start + size as u64;
-            let mut fields = Vec::new();
+    }
 
-            while r.position() < end {
-                match parse_property(r, pak, ver)? {
-                    None => break,
-                    Some(prop) if prop.name == "None" => break,
-                    Some(prop) => fields.push((prop.name.clone(), prop.value)),
+    pub fn write_all<W: Write + Seek>(&self, w: &mut W, pak: &UPKPak, ver: i16) -> Result<()> {
+        use PropertyValue::*;
+        match self {
+            None => {}
+            Byte(b) => w.write_u8(*b)?,
+            Int(i) => w.write_i32::<LittleEndian>(*i)?,
+
+            Bool(b) => w.write_u8(if *b { 1 } else { 0 })?,
+            Float(f) => w.write_f32::<LittleEndian>(*f)?,
+            Object(o) => w.write_i32::<LittleEndian>(*o)?,
+            ObjectRef(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "ObjectRef must be re-resolved to Object before write (Phase 4)",
+                ));
+            }
+            Name(f) => write_fname(w, f)?,
+            EnumLabel(label) => {
+                let val = label.rsplit("::").next().unwrap_or(label);
+                let idx = find_name(pak, val)?;
+                w.write_i32::<LittleEndian>(idx)?;
+                w.write_i32::<LittleEndian>(0)?;
+            }
+            String(s) => write_fstring(w, s)?,
+            Raw(d) => w.write_all(d)?,
+            Array(arr) => {
+                w.write_i32::<LittleEndian>(arr.len() as i32)?;
+                for el in arr {
+                    el.write_all(w, pak, ver)?;
                 }
             }
+            Struct(fields) => {
+                for p in fields {
+                    p.write(w, pak, ver)?;
+                }
 
-            let consumed = r.position().saturating_sub(start);
-            if consumed < size as u64 {
-                r.seek(SeekFrom::Current((size as u64 - consumed) as i64))?;
+                let none_idx = find_name(pak, "None")?;
+                w.write_i32::<LittleEndian>(none_idx)?;
+                w.write_i32::<LittleEndian>(0)?;
             }
-
-            Ok(PropertyValue::Struct(fields))
+            AtomicStruct(fields) => {
+                for (_, v) in fields {
+                    v.write_all(w, pak, ver)?;
+                }
+            }
         }
+        Ok(())
+    }
+}
+
+impl Property {
+    pub fn write<W: Write + Seek>(&self, w: &mut W, pak: &UPKPak, ver: i16) -> Result<()> {
+        let name_idx = find_name(pak, &self.name)?;
+        w.write_i32::<LittleEndian>(name_idx)?;
+        w.write_i32::<LittleEndian>(0)?;
+        if self.name == "None" {
+            return Ok(());
+        }
+
+        let type_idx = find_name(pak, &self.prop_type)?;
+        w.write_i32::<LittleEndian>(type_idx)?;
+        w.write_i32::<LittleEndian>(0)?;
+
+        let size_offset = w.stream_position()?;
+        w.write_i32::<LittleEndian>(0)?;
+        w.write_i32::<LittleEndian>(self.array_index)?;
+
+        let mut bool_in_tag = false;
+        match self.prop_type.as_str() {
+            "StructProperty" => {
+                let sn = self.struct_name.as_deref().unwrap_or("None");
+                let sn_idx = find_name(pak, sn)?;
+                w.write_i32::<LittleEndian>(sn_idx)?;
+                w.write_i32::<LittleEndian>(0)?;
+            }
+            "BoolProperty" => {
+                bool_in_tag = true;
+                let b = matches!(self.value, PropertyValue::Bool(true));
+                if ver >= V_BOOL_OPT {
+                    w.write_u8(if b { 1 } else { 0 })?;
+                } else {
+                    w.write_u32::<LittleEndian>(if b { 1 } else { 0 })?;
+                }
+            }
+            "ByteProperty" if ver >= V_BYTE_ENUM => {
+                let en = self.enum_name.as_deref().unwrap_or("None");
+                let en_idx = find_name(pak, en)?;
+                w.write_i32::<LittleEndian>(en_idx)?;
+                w.write_i32::<LittleEndian>(0)?;
+            }
+            _ => {}
+        }
+
+        let value_start = w.stream_position()?;
+        if !bool_in_tag {
+            self.value.write_all(w, pak, ver)?;
+        }
+        let value_end = w.stream_position()?;
+
+        let size = if bool_in_tag {
+            0
+        } else {
+            (value_end - value_start) as i32
+        };
+        w.seek(SeekFrom::Start(size_offset))?;
+        w.write_i32::<LittleEndian>(size)?;
+        w.seek(SeekFrom::Start(value_end))?;
+        Ok(())
+    }
+
+    pub fn to_bytes(&self, pak: &UPKPak, ver: i16) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut c = Cursor::new(&mut buf);
+        self.write(&mut c, pak, ver)?;
+        Ok(buf)
     }
 }
 
 pub fn parse_property(
     r: &mut Cursor<&Vec<u8>>,
     pak: &UPKPak,
-    ver: i16
-) -> Result<Option<Property>>{
-    let name_pos = r.position();
+    ver: i16,
+) -> Result<Option<Property>> {
+    parse_property_ctx(r, &PropertyCtx::legacy(pak, ver))
+}
 
-    {
-        let end = r.seek(SeekFrom::End(0))?;
+pub fn parse_property_ctx(r: &mut Cursor<&Vec<u8>>, ctx: &PropertyCtx) -> Result<Option<Property>> {
+    let name_pos = r.position();
+    let end = {
+        let e = r.seek(SeekFrom::End(0))?;
         r.seek(SeekFrom::Start(name_pos))?;
-        if name_pos + 8 > end {
-            return Ok(None);
-        }
+        e
+    };
+    if name_pos + 8 > end {
+        return Ok(None);
     }
 
     let prop_fname = read_fname(r)?;
-    
-    if prop_fname.name_index < 0
-        || prop_fname.name_index as usize >= pak.name_table.len()
-    {
+    if prop_fname.name_index < 0 || prop_fname.name_index as usize >= ctx.pak.name_table.len() {
         return Ok(None);
     }
-
-    let prop_name = match resolve_fname(&prop_fname, pak) {
+    let prop_name = match resolve_fname(&prop_fname, ctx.pak) {
         Some(n) => n,
         None => return Ok(None),
     };
-
     if prop_name == "None" {
         return Ok(Some(Property {
-            name: "None".into(), prop_type: "None".into(),
-            size: 0, array_index: 0,
+            name: "None".into(),
+            prop_type: "None".into(),
+            size: 0,
+            array_index: 0,
             value: PropertyValue::None,
-            enum_name: None, struct_name: None,
+            enum_name: None,
+            struct_name: None,
         }));
     }
 
-
     let type_fname = read_fname(r)?;
-
-    if type_fname.name_index < 0
-        || type_fname.name_index as usize >= pak.name_table.len()
-    {
+    if type_fname.name_index < 0 || type_fname.name_index as usize >= ctx.pak.name_table.len() {
         return Ok(None);
     }
-
-    let prop_type = match resolve_fname(&type_fname, pak) {
+    let prop_type = match resolve_fname(&type_fname, ctx.pak) {
         Some(t) => t,
-        None    => return Ok(None),
+        None => return Ok(None),
     };
 
-    const KNOWN_TYPES: &[&str] = &[
-        "IntProperty", "FloatProperty", "BoolProperty", "ByteProperty",
-        "NameProperty", "StrProperty",  "ObjectProperty", "ComponentProperty",
-        "InterfaceProperty", "ClassProperty", "ArrayProperty", "StructProperty",
-        "DelegateProperty", "MapProperty",
+    const KNOWN: &[&str] = &[
+        "IntProperty",
+        "FloatProperty",
+        "BoolProperty",
+        "ByteProperty",
+        "NameProperty",
+        "StrProperty",
+        "ObjectProperty",
+        "ComponentProperty",
+        "InterfaceProperty",
+        "ClassProperty",
+        "ArrayProperty",
+        "StructProperty",
+        "DelegateProperty",
+        "MapProperty",
     ];
-
-    if !KNOWN_TYPES.contains(&prop_type.as_str()) {
+    if !KNOWN.contains(&prop_type.as_str()) {
         return Ok(None);
     }
 
-    let size        = r.read_i32::<LittleEndian>()?;
+    let size = r.read_i32::<LittleEndian>()?;
     let array_index = r.read_i32::<LittleEndian>()?;
 
     let mut struct_name: Option<String> = None;
-    let mut bool_val:    Option<bool>   = None;
-    let mut enum_name:   Option<String> = None;
-    
+    let mut bool_val: Option<bool> = None;
+    let mut enum_name: Option<String> = None;
     match prop_type.as_str() {
         "StructProperty" => {
             let sn = read_fname(r)?;
-            struct_name = resolve_fname(&sn, pak);
+            struct_name = resolve_fname(&sn, ctx.pak);
         }
         "BoolProperty" => {
-            if ver >= VER_PROPERTYTAG_BOOL_OPTIMIZATION {
+            if ctx.ver >= V_BOOL_OPT {
                 bool_val = Some(r.read_u8()? != 0);
             } else {
                 bool_val = Some(r.read_u32::<LittleEndian>()? != 0);
             }
         }
-        "ByteProperty" if ver >= VER_BYTEPROP_SERIALIZE_ENUM => {
+        "ByteProperty" if ctx.ver >= V_BYTE_ENUM => {
             let en = read_fname(r)?;
-            enum_name = resolve_fname(&en, pak);
+            enum_name = resolve_fname(&en, ctx.pak);
             if enum_name.as_deref() == Some("None") {
                 enum_name = None;
             }
@@ -501,83 +368,387 @@ pub fn parse_property(
         _ => {}
     }
 
-    // ── Value ────────────────────────────────────────────────────────────────
     let value_start = r.position();
-
     let value = match prop_type.as_str() {
-        "IntProperty"   => PropertyValue::Int(r.read_i32::<LittleEndian>()?),
+        "IntProperty" => PropertyValue::Int(r.read_i32::<LittleEndian>()?),
         "FloatProperty" => PropertyValue::Float(r.read_f32::<LittleEndian>()?),
-
         "BoolProperty" => PropertyValue::Bool(bool_val.unwrap_or(false)),
-
         "ByteProperty" => {
             if let Some(ref en) = enum_name {
-                let _ = en;
-                PropertyValue::Name(read_fname(r)?)
+                let fn_ = read_fname(r)?;
+                let val_name = resolve_fname(&fn_, ctx.pak).unwrap_or_default();
+                PropertyValue::EnumLabel(format!("{en}::{val_name}"))
             } else {
                 PropertyValue::Byte(r.read_u8()?)
             }
         }
-
-        "NameProperty"   => PropertyValue::Name(read_fname(r)?),
-        "StrProperty"    => PropertyValue::String(read_string(r)?),
-        "ObjectProperty" | "ComponentProperty" | "InterfaceProperty" => {
+        "NameProperty" => PropertyValue::Name(read_fname(r)?),
+        "StrProperty" => PropertyValue::String(read_string(r)?),
+        "ObjectProperty" | "ComponentProperty" | "InterfaceProperty" | "ClassProperty" => {
             PropertyValue::Object(r.read_i32::<LittleEndian>()?)
         }
-        "ClassProperty"  => PropertyValue::Object(r.read_i32::<LittleEndian>()?),
-
-        "ArrayProperty"  => parse_array(r, pak, size, ver)?,
-
+        "ArrayProperty" => parse_array_ctx(r, ctx, size, &prop_name)?,
         "StructProperty" => {
             let sn = struct_name.as_deref().unwrap_or("Unknown");
-            parse_struct(r, pak, size, sn, ver)?
+            parse_struct_ctx(r, ctx, size, sn, &prop_name)?
         }
-
         "DelegateProperty" => {
-            // object ref (i32) + function FName (8 bytes) = 12 bytes
-            let obj  = r.read_i32::<LittleEndian>()?;
+            let obj = r.read_i32::<LittleEndian>()?;
             let func = read_fname(r)?;
-            PropertyValue::Struct(vec![
+
+            PropertyValue::AtomicStruct(vec![
                 ("Object".into(), PropertyValue::Object(obj)),
                 ("Function".into(), PropertyValue::Name(func)),
             ])
         }
-
         "MapProperty" => {
-            // Not common; just swallow the bytes
             let mut buf = vec![0u8; size as usize];
             r.read_exact(&mut buf)?;
             PropertyValue::Raw(buf)
         }
-
-        _ => {
-            eprintln!("warn: unknown property type '{prop_type}' for '{prop_name}' (size={size})");
-            if size > 0 && size < 65536 {
-                let mut buf = vec![0u8; size as usize];
-                r.read_exact(&mut buf)?;
-                PropertyValue::Raw(buf)
-            } else {
-                return Ok(None);
-            }
-        }
+        _ => unreachable!(),
     };
 
-    if prop_type != "BoolProperty" {
+    if !matches!(
+        prop_type.as_str(),
+        "ArrayProperty" | "StructProperty" | "StrProperty" | "DelegateProperty" | "MapProperty"
+    ) && prop_type != "BoolProperty"
+    {
         let consumed = (r.position() - value_start) as i32;
-        if consumed != size && !matches!(prop_type.as_str(),
-            "ArrayProperty" | "StructProperty" | "StrProperty" | "DelegateProperty" | "MapProperty")
-        {
-            eprintln!(
-                "warn: '{prop_name}' ({prop_type}): read {consumed} bytes but tag says {size}"
-            );
+        if consumed != size {
             r.seek(SeekFrom::Start(value_start + size as u64))?;
         }
     }
 
     Ok(Some(Property {
-        name: prop_name, prop_type,
-        size, array_index, value,
-        enum_name, struct_name 
+        name: prop_name,
+        prop_type,
+        size,
+        array_index,
+        value,
+        enum_name,
+        struct_name,
     }))
 }
 
+fn parse_array_ctx(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    size: i32,
+    prop_name: &str,
+) -> Result<PropertyValue> {
+    let count = r.read_i32::<LittleEndian>()?;
+    if count <= 0 {
+        let consumed = 4i64;
+        let remain = size as i64 - consumed;
+        if remain > 0 {
+            r.seek(SeekFrom::Current(remain))?;
+        }
+        return Ok(PropertyValue::Array(Vec::new()));
+    }
+
+    if let (Some(db), Some(owner)) = (ctx.db, &ctx.owner) {
+        if let Ok(Some((inner_ref, inner_entry))) = db.array_inner_for(owner, prop_name) {
+            let mut elems = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                elems.push(read_one_by_inner(r, ctx, &inner_ref, &inner_entry)?);
+            }
+            return Ok(PropertyValue::Array(elems));
+        }
+    }
+
+    let body = (size as u64).saturating_sub(4);
+    let mut buf = vec![0u8; body as usize];
+    r.read_exact(&mut buf)?;
+    if ctx.db.is_none() {
+        eprintln!(
+            "  \x1b[33marr\x1b[0m '{prop_name}': no schema (--game-root); \
+             {count} elements emitted as Raw"
+        );
+    } else {
+        eprintln!(
+            "  \x1b[33marr\x1b[0m '{prop_name}': schema lookup failed; \
+             {count} elements emitted as Raw"
+        );
+    }
+    Ok(PropertyValue::Raw(buf))
+}
+
+fn read_one_by_inner(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    _inner_ref: &ResolvedRef,
+    inner: &SchemaEntry,
+) -> Result<PropertyValue> {
+    let kind = match inner {
+        SchemaEntry::Property(k) => k,
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "array Inner is not a UProperty",
+            ));
+        }
+    };
+    Ok(match kind {
+        PropertyKind::Byte { .. } => PropertyValue::Byte(r.read_u8()?),
+        PropertyKind::Int { .. } => PropertyValue::Int(r.read_i32::<LittleEndian>()?),
+        PropertyKind::Bool { .. } => PropertyValue::Bool(r.read_u8()? != 0),
+        PropertyKind::Float { .. } => PropertyValue::Float(r.read_f32::<LittleEndian>()?),
+        PropertyKind::Object { .. }
+        | PropertyKind::Class { .. }
+        | PropertyKind::Component { .. }
+        | PropertyKind::Interface { .. } => PropertyValue::Object(r.read_i32::<LittleEndian>()?),
+        PropertyKind::Name { .. } => PropertyValue::Name(read_fname(r)?),
+        PropertyKind::Str { .. } => PropertyValue::String(read_string(r)?),
+        PropertyKind::Delegate { .. } => {
+            let obj = r.read_i32::<LittleEndian>()?;
+            let fnf = read_fname(r)?;
+            PropertyValue::AtomicStruct(vec![
+                ("Object".into(), PropertyValue::Object(obj)),
+                ("Function".into(), PropertyValue::Name(fnf)),
+            ])
+        }
+        PropertyKind::Array { .. } => {
+            let cnt = r.read_i32::<LittleEndian>()?;
+            let mut v = Vec::with_capacity(cnt.max(0) as usize);
+            for _ in 0..cnt.max(0) {
+                v.push(read_one_by_inner(r, ctx, _inner_ref, inner)?);
+            }
+            PropertyValue::Array(v)
+        }
+        PropertyKind::Map { .. } => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "TMap inside TArray is not supported",
+            ));
+        }
+        PropertyKind::Struct { struct_obj, .. } => {
+            let owner_pkg = ctx.pak;
+
+            let (struct_ref, sentry) = resolve_struct_obj(ctx, *struct_obj)?;
+            read_struct_value(r, ctx, &struct_ref, &sentry, owner_pkg)?
+        }
+    })
+}
+
+fn parse_struct_ctx(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    size: i32,
+    struct_name: &str,
+    prop_name: &str,
+) -> Result<PropertyValue> {
+    if is_builtin_atomic(struct_name) {
+        return read_builtin_atomic(r, struct_name);
+    }
+
+    if let (Some(db), Some(owner)) = (ctx.db, &ctx.owner) {
+        if let Ok(Some((sref, sentry))) = db.struct_for(owner, prop_name) {
+            let start = r.position();
+            let end = start + size as u64;
+            let v = read_struct_value(r, ctx, &sref, &sentry, ctx.pak)?;
+            if r.position() < end {
+                r.seek(SeekFrom::Start(end))?;
+            } else if r.position() > end {
+                eprintln!(
+                    "  \x1b[33mstruct\x1b[0m '{prop_name}' ({struct_name}): \
+                     overran by {} bytes",
+                    r.position() - end
+                );
+            }
+            return Ok(v);
+        }
+
+        if let Ok(Some((sref, sentry))) = db.lookup_struct_by_name(&owner.stem_lc, struct_name) {
+            let start = r.position();
+            let end = start + size as u64;
+            let v = read_struct_value(r, ctx, &sref, &sentry, ctx.pak)?;
+            if r.position() < end {
+                r.seek(SeekFrom::Start(end))?;
+            }
+            return Ok(v);
+        }
+    }
+
+    let start = r.position();
+    let end = start + size as u64;
+    let mut fields: Vec<Property> = Vec::new();
+    let mut ok = true;
+    loop {
+        if r.position() >= end {
+            break;
+        }
+        match parse_property_ctx(r, &ctx.drop_owner())? {
+            Some(p) if p.name == "None" => break,
+            Some(p) => fields.push(p),
+            None => {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok {
+        if r.position() < end {
+            r.seek(SeekFrom::Start(end))?;
+        }
+        Ok(PropertyValue::Struct(fields))
+    } else {
+        r.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; size as usize];
+        r.read_exact(&mut buf)?;
+        Ok(PropertyValue::Raw(buf))
+    }
+}
+
+fn resolve_struct_obj(
+    ctx: &PropertyCtx,
+    struct_obj: i32,
+) -> Result<(ResolvedRef, std::rc::Rc<SchemaEntry>)> {
+    let db = ctx
+        .db
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no SchemaDb for struct resolution"))?;
+    let owner = ctx
+        .owner
+        .as_ref()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no owner for struct resolution"))?;
+    let pkg = db.open_package(&owner.stem_lc)?;
+    let sref = db
+        .resolve_index(&pkg, struct_obj)?
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "struct_obj didn't resolve"))?;
+    let entry = db.entry(&sref)?;
+    Ok((sref, entry))
+}
+
+fn read_struct_value(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    sref: &ResolvedRef,
+    sentry: &SchemaEntry,
+    _owner_pak: &UPKPak,
+) -> Result<PropertyValue> {
+    let immutable = matches!(
+        sentry,
+        SchemaEntry::ScriptStruct { struct_flags, .. }
+            if (struct_flags & (STRUCT_IMMUTABLE | STRUCT_IMMUTABLE_WHEN_COOKED)) != 0
+    );
+    let child_ctx = ctx.with_owner(sref.clone());
+
+    if immutable {
+        let db = ctx.db.unwrap();
+        let kids = db.list_children(sref).unwrap_or_default();
+        let mut fields = Vec::with_capacity(kids.len());
+        for (name, _cref, centry) in &kids {
+            let v = read_one_by_inner(r, &child_ctx, _cref, centry)?;
+            fields.push((name.clone(), v));
+        }
+        Ok(PropertyValue::AtomicStruct(fields))
+    } else {
+        let mut fields = Vec::new();
+        loop {
+            match parse_property_ctx(r, &child_ctx)? {
+                Some(p) if p.name == "None" => break,
+                Some(p) => fields.push(p),
+                None => break,
+            }
+        }
+        Ok(PropertyValue::Struct(fields))
+    }
+}
+
+pub const STRUCT_IMMUTABLE: u32 = 0x00000020;
+pub const STRUCT_IMMUTABLE_WHEN_COOKED: u32 = 0x00000080;
+pub const STRUCT_ATOMIC: u32 = 0x00000010;
+
+fn read_builtin_atomic(r: &mut Cursor<&Vec<u8>>, name: &str) -> Result<PropertyValue> {
+    let mk = |f: Vec<(&str, PropertyValue)>| {
+        PropertyValue::AtomicStruct(f.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
+    };
+    Ok(match name {
+        "Guid" => mk(vec![
+            ("A", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+            ("B", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+            ("C", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+            ("D", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+        ]),
+        "Vector" => mk(vec![
+            ("X", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("Y", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("Z", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+        ]),
+        "Vector2D" => mk(vec![
+            ("X", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("Y", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+        ]),
+        "Vector4" | "Quat" | "Plane" => mk(vec![
+            ("X", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("Y", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("Z", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("W", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+        ]),
+        "Rotator" => mk(vec![
+            ("Pitch", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+            ("Yaw", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+            ("Roll", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+        ]),
+        "Color" => mk(vec![
+            ("B", PropertyValue::Byte(r.read_u8()?)),
+            ("G", PropertyValue::Byte(r.read_u8()?)),
+            ("R", PropertyValue::Byte(r.read_u8()?)),
+            ("A", PropertyValue::Byte(r.read_u8()?)),
+        ]),
+        "LinearColor" => mk(vec![
+            ("R", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("G", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("B", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("A", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+        ]),
+        "IntPoint" => mk(vec![
+            ("X", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+            ("Y", PropertyValue::Int(r.read_i32::<LittleEndian>()?)),
+        ]),
+        "Box" => {
+            let v = mk(vec![
+                ("MinX", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+                ("MinY", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+                ("MinZ", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+                ("MaxX", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+                ("MaxY", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+                ("MaxZ", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+                ("IsValid", PropertyValue::Byte(r.read_u8()?)),
+            ]);
+            v
+        }
+        "Box2D" => mk(vec![
+            ("MinX", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("MinY", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("MaxX", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("MaxY", PropertyValue::Float(r.read_f32::<LittleEndian>()?)),
+            ("IsValid", PropertyValue::Byte(r.read_u8()?)),
+        ]),
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("builtin atomic '{name}' not in fast-path table"),
+            ));
+        }
+    })
+}
+
+pub fn parse_array(
+    r: &mut Cursor<&Vec<u8>>,
+    pak: &UPKPak,
+    size: i32,
+    ver: i16,
+) -> Result<PropertyValue> {
+    parse_array_ctx(r, &PropertyCtx::legacy(pak, ver), size, "")
+}
+
+pub fn parse_struct(
+    r: &mut Cursor<&Vec<u8>>,
+    pak: &UPKPak,
+    size: i32,
+    struct_name: &str,
+    ver: i16,
+) -> Result<PropertyValue> {
+    parse_struct_ctx(r, &PropertyCtx::legacy(pak, ver), size, struct_name, "")
+}

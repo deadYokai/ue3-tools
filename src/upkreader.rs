@@ -1,13 +1,25 @@
-use std::{collections::HashMap, fmt, fs::File, io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write}, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    fmt,
+    fs::File,
+    io::{Cursor, Error, ErrorKind, Read, Result, Seek, Write},
+    path::{Path, PathBuf},
+};
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use ron::ser::{to_string_pretty, PrettyConfig};
-use serde::{Serialize, Deserialize};
+use crate::{
+    schemadb::{ResolvedRef, SchemaDb},
+    upkdecompress::{CompressedChunk, CompressionMethod},
+    upkprops::{self, Property, PropertyCtx, PropertyValue, parse_property_ctx},
+    versions::{
+        PKG_FILTER_EDITOR_ONLY, VER_ADDITIONAL_COOK_PACKAGE_SUMMARY, VER_TEXTURE_PREALLOCATION,
+    },
+};
 use bitflags::bitflags;
-use crate::{upkdecompress::{CompressedChunk, CompressionMethod}, upkprops::{self, Property, PropertyValue}};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use ron::ser::{PrettyConfig, to_string_pretty};
+use serde::{Deserialize, Serialize};
 
 use crate::scriptdisasm::{disasm_function, extract_script_from_export_blob, print_disasm};
-
 
 pub const PACKAGE_TAG: u32 = 0x9E2A83C1;
 
@@ -50,14 +62,17 @@ impl PackageFlags {
             (PackageFlags::DisallowLazyLoading, "DisallowLazyLoading"),
             (PackageFlags::ContainsScript, "ContainsScript"),
             (PackageFlags::ContainsDebugInfo, "ContainsDebugInfo"),
-            (PackageFlags::RequireImportsAlreadyLoaded, "RequireImportsAlreadyLoaded"),
+            (
+                PackageFlags::RequireImportsAlreadyLoaded,
+                "RequireImportsAlreadyLoaded",
+            ),
             (PackageFlags::StoreCompressed, "StoreCompressed"),
             (PackageFlags::StoreFullyCompressed, "StoreFullyCompressed"),
             (PackageFlags::NoExportAllowed, "NoExportAllowed"),
             (PackageFlags::StrippedSource, "StrippedSource"),
             (PackageFlags::FilterEditorOnly, "FilterEditorOnly"),
         ] {
-            if self.contains(flag){
+            if self.contains(flag) {
                 println!(" - {}", name);
             }
         }
@@ -65,21 +80,19 @@ impl PackageFlags {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NameEntry
-{
-   pub name: String,
-   pub flags: u64,
+pub struct NameEntry {
+    pub name: String,
+    pub flags: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
 pub struct FName {
     pub name_index: i32,
-    pub name_instance: i32
+    pub name_instance: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Export
-{
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Export {
     pub class_index: i32,
     pub super_index: i32,
     pub outer_index: i32,
@@ -92,7 +105,7 @@ pub struct Export
     pub export_flags: u32,
     pub generation_net_object_count: Vec<i32>,
     pub package_guid: [i32; 4],
-    pub package_flags: u32
+    pub package_flags: u32,
 }
 
 pub fn resolve_object_refs(props: &mut Vec<Property>, pkg: &UPKPak) {
@@ -111,7 +124,7 @@ fn resolve_value(val: &mut PropertyValue, pkg: &UPKPak) {
             } else {
                 "None".to_string()
             };
-            *val = PropertyValue::String(name);
+            *val = PropertyValue::ObjectRef(name);
         }
         PropertyValue::Array(elements) => {
             for el in elements.iter_mut() {
@@ -119,6 +132,11 @@ fn resolve_value(val: &mut PropertyValue, pkg: &UPKPak) {
             }
         }
         PropertyValue::Struct(fields) => {
+            for p in fields.iter_mut() {
+                resolve_value(&mut p.value, pkg);
+            }
+        }
+        PropertyValue::AtomicStruct(fields) => {
             for (_, v) in fields.iter_mut() {
                 resolve_value(v, pkg);
             }
@@ -131,16 +149,15 @@ fn resolve_value(val: &mut PropertyValue, pkg: &UPKPak) {
 }
 
 impl Export {
-    pub fn read(cursor: &mut Cursor<&Vec<u8>>, ver: i16) -> Result<Self>{
+    pub fn read(cursor: &mut Cursor<&Vec<u8>>, ver: i16) -> Result<Self> {
         let class_index = cursor.read_i32::<LittleEndian>()?;
         let super_index = cursor.read_i32::<LittleEndian>()?;
         let outer_index = cursor.read_i32::<LittleEndian>()?;
 
-        let object_name = FName { 
-            name_index: cursor.read_i32::<LittleEndian>()?, 
-            name_instance: cursor.read_i32::<LittleEndian>()?
+        let object_name = FName {
+            name_index: cursor.read_i32::<LittleEndian>()?,
+            name_instance: cursor.read_i32::<LittleEndian>()?,
         };
-
 
         let archetype = cursor.read_i32::<LittleEndian>()?;
 
@@ -148,14 +165,14 @@ impl Export {
 
         let serial_size = cursor.read_i32::<LittleEndian>()?;
         let serial_offset = cursor.read_i32::<LittleEndian>()?;
-        
+
         let mut legacy_component_map: HashMap<FName, i32> = HashMap::new();
         if ver < 543 {
             let count = cursor.read_i32::<LittleEndian>()?;
             for _ in 0..count {
-                let k = FName { 
-                    name_index: cursor.read_i32::<LittleEndian>()?, 
-                    name_instance: cursor.read_i32::<LittleEndian>()?
+                let k = FName {
+                    name_index: cursor.read_i32::<LittleEndian>()?,
+                    name_instance: cursor.read_i32::<LittleEndian>()?,
                 };
                 let v = cursor.read_i32::<LittleEndian>()?;
                 legacy_component_map.insert(k, v);
@@ -163,7 +180,7 @@ impl Export {
         }
 
         let export_flags = cursor.read_u32::<LittleEndian>()?;
-    
+
         let gen_count = cursor.read_i32::<LittleEndian>()?;
         let mut generation_net_object_count = Vec::with_capacity(gen_count as usize);
         for _ in 0..gen_count {
@@ -174,7 +191,7 @@ impl Export {
             cursor.read_i32::<LittleEndian>()?,
             cursor.read_i32::<LittleEndian>()?,
             cursor.read_i32::<LittleEndian>()?,
-            cursor.read_i32::<LittleEndian>()?
+            cursor.read_i32::<LittleEndian>()?,
         ];
         let package_flags = cursor.read_u32::<LittleEndian>()?;
 
@@ -191,18 +208,17 @@ impl Export {
             export_flags,
             generation_net_object_count,
             package_guid,
-            package_flags
+            package_flags,
         })
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Import
-{
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Import {
     pub class_package: FName,
     pub class_name: FName,
     pub outer_index: i32,
-    pub object_name: FName
+    pub object_name: FName,
 }
 
 impl Import {
@@ -226,16 +242,118 @@ impl Import {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct GenerationInfo
-{
+pub struct GenerationInfo {
     export_count: i32,
     name_count: i32,
-    net_obj_count: i32
+    net_obj_count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FTextureType {
+    pub size_x: i32,
+    pub size_y: i32,
+    pub num_mips: i32,
+    pub format: u32,
+    pub tex_create_flags: u32,
+    pub export_indices: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FTextureAllocations {
+    pub texture_types: Vec<FTextureType>,
+}
+
+impl FTextureType {
+    fn read<R: Read>(r: &mut R) -> Result<Self> {
+        let size_x = r.read_i32::<LittleEndian>()?;
+        let size_y = r.read_i32::<LittleEndian>()?;
+        let num_mips = r.read_i32::<LittleEndian>()?;
+        let format = r.read_u32::<LittleEndian>()?;
+        let tex_create_flags = r.read_u32::<LittleEndian>()?;
+        let n = r.read_i32::<LittleEndian>()?;
+        if n < 0 || n > 0x10_0000 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("FTextureType: implausible ExportIndices count {}", n),
+            ));
+        }
+        let mut export_indices = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            export_indices.push(r.read_i32::<LittleEndian>()?);
+        }
+        Ok(Self {
+            size_x,
+            size_y,
+            num_mips,
+            format,
+            tex_create_flags,
+            export_indices,
+        })
+    }
+
+    fn write<W: Write>(&self, w: &mut W) -> Result<()> {
+        w.write_i32::<LittleEndian>(self.size_x)?;
+        w.write_i32::<LittleEndian>(self.size_y)?;
+        w.write_i32::<LittleEndian>(self.num_mips)?;
+        w.write_u32::<LittleEndian>(self.format)?;
+        w.write_u32::<LittleEndian>(self.tex_create_flags)?;
+        w.write_i32::<LittleEndian>(self.export_indices.len() as i32)?;
+        for &i in &self.export_indices {
+            w.write_i32::<LittleEndian>(i)?;
+        }
+        Ok(())
+    }
+}
+
+impl FTextureAllocations {
+    fn read<R: Read>(r: &mut R) -> Result<Self> {
+        let n = r.read_i32::<LittleEndian>()?;
+        if n < 0 || n > 0x10_0000 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("FTextureAllocations: implausible TextureTypes count {}", n),
+            ));
+        }
+        let mut texture_types = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            texture_types.push(FTextureType::read(r)?);
+        }
+        Ok(Self { texture_types })
+    }
+
+    fn write<W: Write>(&self, w: &mut W) -> Result<()> {
+        w.write_i32::<LittleEndian>(self.texture_types.len() as i32)?;
+        for t in &self.texture_types {
+            t.write(w)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn write_fstring<W: Write>(w: &mut W, s: &str) -> Result<()> {
+    if s.is_empty() {
+        w.write_i32::<LittleEndian>(0)?;
+        return Ok(());
+    }
+    if s.is_ascii() {
+        let len = s.len() as i32 + 1;
+        w.write_i32::<LittleEndian>(len)?;
+        w.write_all(s.as_bytes())?;
+        w.write_u8(0)?;
+    } else {
+        let utf16: Vec<u16> = s.encode_utf16().collect();
+        let len = -(utf16.len() as i32 + 1);
+        w.write_i32::<LittleEndian>(len)?;
+        for c in &utf16 {
+            w.write_u16::<LittleEndian>(*c)?;
+        }
+        w.write_u16::<LittleEndian>(0)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UpkHeader
-{
+pub struct UpkHeader {
     pub sign: u32,
     pub p_ver: i16,
     pub l_ver: i16,
@@ -259,25 +377,23 @@ pub struct UpkHeader
     pub gens: Vec<GenerationInfo>,
     pub engine_ver: i32,
     pub cooker_ver: i32,
-    pub compression_method: CompressionMethod, 
+    pub compression_method: CompressionMethod,
     pub compressed_chunks_count: u32,
     pub compressed_chunks: Vec<CompressedChunk>,
     pub package_source: i32,
-    pub additional_packages: i32,
-    pub texture_allocs: i32,
+    pub additional_packages: Vec<String>,
+    pub texture_allocs: FTextureAllocations,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UPKPak
-{
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UPKPak {
     pub name_table: Vec<String>,
     pub export_table: Vec<Export>,
     pub import_table: Vec<Import>,
 }
 
-impl UPKPak { 
-    pub fn parse_upk(cursor: &mut Cursor<&Vec<u8>>, header: &UpkHeader) -> Result<Self>
-    {
+impl UPKPak {
+    pub fn parse_upk(cursor: &mut Cursor<&Vec<u8>>, header: &UpkHeader) -> Result<Self> {
         let name_count = header.name_count;
         let name_offset = header.name_offset;
         let export_count = header.export_count;
@@ -287,28 +403,29 @@ impl UPKPak {
 
         let mut name_table = Vec::new();
         cursor.set_position(name_offset as u64);
-        for _ in 0..name_count
-        {
+        for _ in 0..name_count {
             let name = read_name(cursor)?;
             name_table.push(name.name);
         }
 
         let mut export_table = Vec::new();
         cursor.set_position(export_offset as u64);
-        for _ in 0..export_count
-        {
+        for _ in 0..export_count {
             export_table.push(Export::read(cursor, header.p_ver)?);
         }
 
         let mut import_table = Vec::new();
 
         cursor.set_position(import_offset as u64);
-        for _ in 0..import_count
-        {
+        for _ in 0..import_count {
             import_table.push(Import::read(cursor)?);
         }
 
-        Ok(Self{name_table, export_table, import_table})
+        Ok(Self {
+            name_table,
+            export_table,
+            import_table,
+        })
     }
 
     pub fn fname_to_string(&self, fname: &FName) -> String {
@@ -366,34 +483,37 @@ impl UPKPak {
         let mut linker_index = -import_index - 1;
 
         while linker_index != 0 {
-            let (object_name, outer_index, is_subobject) = 
-                if linker_index >= 0 {
-                    let idx = linker_index as usize;
-                    if let Some(import) = self.import_table.get(idx) {
-                        let is_subobj = !result.is_empty() 
-                            && self.fname_to_string(&import.class_name) != "Package"
-                            && self.is_package_outer(import.outer_index);
-                        
-                        (self.fname_to_string(&import.object_name), 
-                         import.outer_index, 
-                         is_subobj)
-                    } else {
-                        break;
-                    }
+            let (object_name, outer_index, is_subobject) = if linker_index >= 0 {
+                let idx = linker_index as usize;
+                if let Some(import) = self.import_table.get(idx) {
+                    let is_subobj = !result.is_empty()
+                        && self.fname_to_string(&import.class_name) != "Package"
+                        && self.is_package_outer(import.outer_index);
+
+                    (
+                        self.fname_to_string(&import.object_name),
+                        import.outer_index,
+                        is_subobj,
+                    )
                 } else {
-                    let idx = (-linker_index - 1) as usize;
-                    if let Some(export) = self.export_table.get(idx) {
-                        let is_subobj = !result.is_empty()
-                            && self.get_class_name(-linker_index) != "Package"
-                            && self.is_package_outer(export.outer_index);
-                        
-                        (self.fname_to_string(&export.object_name),
-                         export.outer_index,
-                         is_subobj)
-                    } else {
-                        break;
-                    }
-                };
+                    break;
+                }
+            } else {
+                let idx = (-linker_index - 1) as usize;
+                if let Some(export) = self.export_table.get(idx) {
+                    let is_subobj = !result.is_empty()
+                        && self.get_class_name(-linker_index) != "Package"
+                        && self.is_package_outer(export.outer_index);
+
+                    (
+                        self.fname_to_string(&export.object_name),
+                        export.outer_index,
+                        is_subobj,
+                    )
+                } else {
+                    break;
+                }
+            };
 
             if !result.is_empty() {
                 result = if is_subobject {
@@ -420,7 +540,7 @@ impl UPKPak {
                 if !result.is_empty() {
                     let is_subobject = self.get_class_name(linker_index) != "Package"
                         && self.is_package_outer(export.outer_index);
-                    
+
                     result = if is_subobject {
                         format!(":{}", result)
                     } else {
@@ -428,9 +548,7 @@ impl UPKPak {
                     };
                 }
 
-                result = format!("{}{}", 
-                    self.fname_to_string(&export.object_name), 
-                    result);
+                result = format!("{}{}", self.fname_to_string(&export.object_name), result);
                 linker_index = export.outer_index;
             } else {
                 break;
@@ -466,14 +584,14 @@ impl UPKPak {
         if outer_index == 0 {
             return true;
         }
-        
+
         if outer_index > 0 {
             self.get_export_class_name(outer_index) == "Package"
         } else {
             self.get_import_class_name(outer_index) == "Package"
         }
     }
-    
+
     fn ue_name_to_path(full_name: &str) -> String {
         let parts: Vec<&str> = full_name.splitn(2, ' ').collect();
 
@@ -524,11 +642,13 @@ pub fn write_extracted_file(
     path: &Path,
     buf: &[u8],
     pkg: &UPKPak,
-    ver: i16
-) -> Result<PathBuf> {    
-    let ext  = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
+    ver: i16,
+    db: Option<&SchemaDb>,
+    owner: Option<ResolvedRef>,
+) -> Result<PathBuf> {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("obj");
-    let dir  = path.parent().unwrap();
+    let dir = path.parent().unwrap();
     let mut new_path = dir.join(name);
 
     match ext {
@@ -541,18 +661,22 @@ pub fn write_extracted_file(
                 Some(script) => {
                     let stmts = disasm_function(&script, pkg);
                     if !stmts.is_empty() {
-                        let text     = print_disasm(&stmts);
+                        let text = print_disasm(&stmts);
                         let asm_path = path.with_extension("asm");
                         let mut asm_file = File::create(&asm_path)?;
                         asm_file.write_all(text.as_bytes())?;
                         println!(
                             "  \x1b[36mdisasm\x1b[0m → \x1b[32m{}\x1b[0m  ({} stmts)",
-                            asm_path.display(), stmts.len()
+                            asm_path.display(),
+                            stmts.len()
                         );
                     }
                 }
                 None => {
-                    eprintln!("  \x1b[33mwarn\x1b[0m: could not locate Script in {}", path.display());
+                    eprintln!(
+                        "  \x1b[33mwarn\x1b[0m: could not locate Script in {}",
+                        path.display()
+                    );
                 }
             }
         }
@@ -566,11 +690,7 @@ pub fn write_extracted_file(
                 .iter()
                 .find(|p| p.name == "RawData")
                 .and_then(|p| p.value.as_vec())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|el| el.as_byte())
-                        .collect()
-                });
+                .map(|arr| arr.iter().filter_map(|el| el.as_byte()).collect());
 
             if let Some(bytes) = rawdata_bytes.filter(|b| !b.is_empty()) {
                 // Replace the RawData value with a filename reference.
@@ -584,7 +704,8 @@ pub fn write_extracted_file(
                 let ron_string = to_string_pretty(
                     &(format!("{}.{}", name, ext), &props),
                     PrettyConfig::new().struct_names(true),
-                ).unwrap();
+                )
+                .unwrap();
 
                 new_path = new_path.with_extension("ron");
                 writeln!(File::create(&new_path)?, "{ron_string}")?;
@@ -599,11 +720,11 @@ pub fn write_extracted_file(
         }
 
         _ => {
-            let buf_vec    = buf.to_vec();
+            let buf_vec = buf.to_vec();
             let mut cursor = Cursor::new(&buf_vec);
 
             let (mut props, props_end) =
-                get_obj_props(&mut cursor, pkg, false, ver)?;
+                get_obj_props_with_db(&mut cursor, pkg, false, ver, db, owner.clone())?;
 
             let tail = &buf_vec[props_end as usize..];
 
@@ -618,20 +739,18 @@ pub fn write_extracted_file(
                     File::create(&bin_path)?.write_all(tail)?;
                     println!(
                         "  \x1b[35mbinary\x1b[0m → \x1b[32m{}\x1b[0m  ({} bytes)",
-                        bin_path.display(), tail.len()
+                        bin_path.display(),
+                        tail.len()
                     );
 
-                    let ron_string = to_string_pretty(
-                        &(format!("{}.{}", name, ext), &props, &bin_name),
-                        config,
-                    ).unwrap();
+                    let ron_string =
+                        to_string_pretty(&(format!("{}.{}", name, ext), &props, &bin_name), config)
+                            .unwrap();
                     new_path = new_path.with_extension("ron");
                     writeln!(File::create(&new_path)?, "{ron_string}")?;
                 } else {
-                    let ron_string = to_string_pretty(
-                        &(format!("{}.{}", name, ext), &props),
-                        config,
-                    ).unwrap();
+                    let ron_string =
+                        to_string_pretty(&(format!("{}.{}", name, ext), &props), config).unwrap();
                     new_path = new_path.with_extension("ron");
                     writeln!(File::create(&new_path)?, "{ron_string}")?;
                 }
@@ -646,18 +765,26 @@ pub fn write_extracted_file(
     Ok(new_path)
 }
 
-pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, out_dir: &Path, all: bool, ver: i16) -> Result<()> {
-
+pub fn extract_by_name(
+    cursor: &mut Cursor<Vec<u8>>,
+    pkg: &UPKPak,
+    path: &str,
+    out_dir: &Path,
+    all: bool,
+    ver: i16,
+    db: Option<&SchemaDb>,
+    pkg_stem_lc: &str,
+) -> Result<()> {
     let mut found = false;
 
     for (idx, exp) in pkg.export_table.iter().enumerate() {
         let full_name = pkg.get_export_full_name((idx + 1) as i32);
-        
+
         let fs_path = UPKPak::ue_name_to_path(&full_name);
-        
+
         if fs_path.contains(path) || full_name.contains(path) || all {
             let exp = &pkg.export_table[idx];
-            
+
             let file_path = out_dir.join(&fs_path);
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -666,8 +793,22 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
             cursor.seek(std::io::SeekFrom::Start(exp.serial_offset as u64))?;
             let mut buffer = vec![0u8; exp.serial_size as usize];
             cursor.read_exact(&mut buffer)?;
+            let class_ref = if exp.class_index > 0 {
+                Some(ResolvedRef {
+                    stem_lc: pkg_stem_lc.to_string(),
+                    export_idx: exp.class_index,
+                })
+            } else if exp.class_index < 0 {
+                db.and_then(|d| {
+                    d.open_package(pkg_stem_lc)
+                        .ok()
+                        .and_then(|lp| d.resolve_index(&lp, exp.class_index).ok().flatten())
+                })
+            } else {
+                None
+            };
 
-            let out_path = write_extracted_file(&file_path, &buffer, pkg, ver)?;
+            let out_path = write_extracted_file(&file_path, &buffer, pkg, ver, db, class_ref)?;
 
             println!(
                 "Exported \x1b[93m{}\x1b[0m (\x1b[33m{}\x1b[0m bytes) to\n\t \x1b[32m{}\x1b[0m",
@@ -679,20 +820,17 @@ pub fn extract_by_name(cursor: &mut Cursor<Vec<u8>>, pkg: &UPKPak, path: &str, o
         }
     }
 
-    if !found
-    {
+    if !found {
         println!("File {} not exists in package.", path);
     }
 
     Ok(())
 }
 
-pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<NameEntry>
-{
+pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<NameEntry> {
     let length = cursor.read_i32::<LittleEndian>()?;
 
     let name = if length < 0 {
-
         let abs_length = (-length) as usize;
         let mut u16_chars = vec![0u16; abs_length];
         for i in 0..abs_length {
@@ -717,21 +855,17 @@ pub fn read_name(cursor: &mut Cursor<&Vec<u8>>) -> Result<NameEntry>
     Ok(NameEntry { name, flags })
 }
 
-pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
-{
+pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String> {
     let len = cursor.read_i32::<LittleEndian>()?;
-    if len == 0
-    {
+    if len == 0 {
         return Ok("".to_string());
     }
 
-    if len > 0
-    {
+    if len > 0 {
         let mut buf = vec![0u8; len as usize];
         cursor.read_exact(&mut buf)?;
 
-        if buf.last() == Some(&0)
-        {
+        if buf.last() == Some(&0) {
             buf.pop();
         }
 
@@ -746,14 +880,50 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String>
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
 
-        let utf16_trimmed = match utf16.last()
-        {
+        let utf16_trimmed = match utf16.last() {
             Some(&0) => &utf16[..utf16.len() - 1],
-            _ => &utf16[..]
+            _ => &utf16[..],
         };
 
         String::from_utf16(utf16_trimmed)
             .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF16"))
+    }
+}
+
+pub fn read_fstring_stream<R: Read>(r: &mut R) -> Result<String> {
+    let len = r.read_i32::<LittleEndian>()?;
+    if len == 0 {
+        return Ok(String::new());
+    }
+    if len > 0 {
+        if len > 0x10_0000 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("FString: implausible ANSI length {}", len),
+            ));
+        }
+        let mut buf = vec![0u8; len as usize];
+        r.read_exact(&mut buf)?;
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+        Ok(buf.iter().map(|&b| b as char).collect())
+    } else {
+        let n = (-len) as usize;
+        if n > 0x10_0000 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("FString: implausible UTF-16 length {}", n),
+            ));
+        }
+        let mut u = vec![0u16; n];
+        for slot in &mut u {
+            *slot = r.read_u16::<LittleEndian>()?;
+        }
+        if u.last() == Some(&0) {
+            u.pop();
+        }
+        String::from_utf16(&u).map_err(|_| Error::new(ErrorKind::InvalidData, "bad UTF-16"))
     }
 }
 
@@ -787,7 +957,9 @@ pub fn get_obj_props(
                 last_pos = cursor.position();
                 let is_none = prop.name == "None";
                 props.push(prop);
-                if is_none { break; }
+                if is_none {
+                    break;
+                }
             }
         }
     }
@@ -795,11 +967,53 @@ pub fn get_obj_props(
     Ok((props, cursor.position()))
 }
 
+pub fn get_obj_props_with_db(
+    cursor: &mut Cursor<&Vec<u8>>,
+    upk: &UPKPak,
+    print_out: bool,
+    ver: i16,
+    db: Option<&SchemaDb>,
+    owner: Option<ResolvedRef>,
+) -> Result<(Vec<Property>, u64)> {
+    let ctx = PropertyCtx {
+        pak: upk,
+        ver,
+        db,
+        owner,
+    };
+    let mut props = Vec::new();
+    let mut last_pos = cursor.position();
 
-impl fmt::Display for UpkHeader 
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result 
-    {
+    loop {
+        let before = cursor.position();
+        let result = parse_property_ctx(cursor, &ctx);
+        match result {
+            Err(_) => {
+                cursor.set_position(last_pos);
+                break;
+            }
+            Ok(None) => {
+                cursor.set_position(before);
+                break;
+            }
+            Ok(Some(prop)) => {
+                if print_out {
+                    println!("{:?}", prop);
+                }
+                last_pos = cursor.position();
+                let is_none = prop.name == "None";
+                props.push(prop);
+                if is_none {
+                    break;
+                }
+            }
+        }
+    }
+    Ok((props, cursor.position()))
+}
+
+impl fmt::Display for UpkHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Package Signature: {:x?}", self.sign)?;
         writeln!(f, "Package Version: {}", self.p_ver)?;
         writeln!(f, "Licensee Version: {}", self.l_ver)?;
@@ -811,23 +1025,25 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Export Count: {}", self.export_count)?;
         writeln!(f, "Import Count: {}", self.import_count)?;
         if self.p_ver >= 623 {
-            writeln!(f, "Import/Export Guids pos: {}", self.import_export_guids_offset)?;
+            writeln!(
+                f,
+                "Import/Export Guids pos: {}",
+                self.import_export_guids_offset
+            )?;
             writeln!(f, "Import Guids Count: {}", self.import_guids_count)?;
             writeln!(f, "Export Guids Count: {}", self.export_guids_count)?;
-        } 
-        if self.p_ver >= 584{ 
+        }
+        if self.p_ver >= 584 {
             writeln!(f, "Thumbnail table pos: {}", self.thumbnail_table_offest)?;
         }
         writeln!(f, "GUID: {:x?}", self.guid)?;
-        if self.gen_count > 0
-        {
+        if self.gen_count > 0 {
             writeln!(f, "Generations (Count={}):", self.gen_count)?;
         }
-        for (i, gens) in self.gens.iter().enumerate()
-        {
+        for (i, gens) in self.gens.iter().enumerate() {
             writeln!(
-                f, 
-                " - Gen {}:\n   * Exports = {}\n   * Names   = {}\n   * NetObjs = {}", 
+                f,
+                " - Gen {}:\n   * Exports = {}\n   * Names   = {}\n   * NetObjs = {}",
                 i, gens.export_count, gens.name_count, gens.net_obj_count
             )?;
         }
@@ -835,31 +1051,60 @@ impl fmt::Display for UpkHeader
         writeln!(f, "Cooker Version: {}", self.cooker_ver)?;
         writeln!(f, "Compression Flags: {:#?}", self.compression_method)?;
         if self.compression_method != CompressionMethod::None {
-            writeln!(f, "Num of compressed chunks: {}", self.compressed_chunks_count)?;
-            for (i, c) in self.compressed_chunks.iter().enumerate(){
+            writeln!(
+                f,
+                "Num of compressed chunks: {}",
+                self.compressed_chunks_count
+            )?;
+            for (i, c) in self.compressed_chunks.iter().enumerate() {
                 writeln!(
-                    f, 
+                    f,
                     " - Chunk {}:\n\
                     \x20  * Decompressed offset = {}\n\
                     \x20  * Decompressed size   = {}\n\
                     \x20  * Compressed offset   = {}\n\
-                    \x20  * Compressed size     = {}", 
-                    i, c.decompressed_offset,
+                    \x20  * Compressed size     = {}",
+                    i,
+                    c.decompressed_offset,
                     c.decompressed_size,
                     c.compressed_offset,
                     c.compressed_size
                 )?;
             }
         }
-        
+
         writeln!(f, "Package Source: {}", self.package_source)?;
 
-        if self.p_ver >= 516 {
-            writeln!(f, "Additional packages: {}", self.additional_packages)?;
+        if self.p_ver >= VER_ADDITIONAL_COOK_PACKAGE_SUMMARY {
+            writeln!(
+                f,
+                "Additional packages to cook: {}",
+                self.additional_packages.len()
+            )?;
+            for (i, p) in self.additional_packages.iter().enumerate() {
+                writeln!(f, " - [{}] {}", i, p)?;
+            }
         }
 
-        if self.p_ver >= 767 {
-            writeln!(f, "Texture Allocations: {}", self.texture_allocs)?;
+        if self.p_ver >= VER_TEXTURE_PREALLOCATION {
+            writeln!(
+                f,
+                "TextureAllocations: {} type(s)",
+                self.texture_allocs.texture_types.len()
+            )?;
+            for (i, t) in self.texture_allocs.texture_types.iter().enumerate() {
+                writeln!(
+                    f,
+                    " - [{}] {}x{} mips={} fmt={} flags=0x{:08x} -> {} export(s)",
+                    i,
+                    t.size_x,
+                    t.size_y,
+                    t.num_mips,
+                    t.format,
+                    t.tex_create_flags,
+                    t.export_indices.len()
+                )?;
+            }
         }
 
         Ok(())
@@ -867,12 +1112,13 @@ impl fmt::Display for UpkHeader
 }
 
 impl UpkHeader {
-    pub fn read<R: Read + Seek>(mut reader: R) -> Result<Self>
-    {
+    pub fn read<R: Read + Seek>(mut reader: R) -> Result<Self> {
         let sign = reader.read_u32::<LittleEndian>()?;
-        if sign != PACKAGE_TAG
-        {
-            return Err(Error::new(ErrorKind::InvalidData, format!("Invalid file signature, sig=0x{:X}", sign)));
+        if sign != PACKAGE_TAG {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid file signature, sig=0x{:X}", sign),
+            ));
         }
 
         let p_ver = reader.read_i16::<LittleEndian>()?;
@@ -881,8 +1127,7 @@ impl UpkHeader {
 
         let path_len = reader.read_i32::<LittleEndian>()?;
         let mut rfl = path_len;
-        if path_len < 0
-        {
+        if path_len < 0 {
             rfl = path_len * -2; // needed if utf16
         }
         let mut path = vec![0u8; rfl as usize];
@@ -898,58 +1143,53 @@ impl UpkHeader {
         let import_offset = reader.read_i32::<LittleEndian>()?;
         let depends_offset = reader.read_i32::<LittleEndian>()?;
 
-        if import_count <= 0 || name_count <= 0 || export_count <= 0
-        {
+        if import_count <= 0 || name_count <= 0 || export_count <= 0 {
             return Err(Error::new(ErrorKind::InvalidData, "Corrupted pak"));
         }
-        
+
         let mut import_export_guids_offset = -1;
         let mut import_guids_count = 0;
         let mut export_guids_count = 0;
         let mut thumbnail_table_offest = 0;
-        
+
         if p_ver >= 623 {
             import_export_guids_offset = reader.read_i32::<LittleEndian>()?;
             import_guids_count = reader.read_u32::<LittleEndian>()?;
             export_guids_count = reader.read_u32::<LittleEndian>()?;
         }
 
-        if p_ver >= 584{ 
+        if p_ver >= 584 {
             thumbnail_table_offest = reader.read_u32::<LittleEndian>()?;
         }
 
-        let guid =
-            [
+        let guid = [
             reader.read_i32::<LittleEndian>()?,
             reader.read_i32::<LittleEndian>()?,
             reader.read_i32::<LittleEndian>()?,
             reader.read_i32::<LittleEndian>()?,
-            ];
+        ];
 
         let gen_count = reader.read_i32::<LittleEndian>()?;
         let mut gens = Vec::with_capacity(gen_count as usize);
 
-        for _ in 0..gen_count
-        {
-            gens.push(
-                GenerationInfo
-                {
-                    export_count: reader.read_i32::<LittleEndian>()?,
-                    name_count: reader.read_i32::<LittleEndian>()?,
-                    net_obj_count: reader.read_i32::<LittleEndian>()?
-                }
-            );
+        for _ in 0..gen_count {
+            gens.push(GenerationInfo {
+                export_count: reader.read_i32::<LittleEndian>()?,
+                name_count: reader.read_i32::<LittleEndian>()?,
+                net_obj_count: reader.read_i32::<LittleEndian>()?,
+            });
         }
 
         let engine_ver = reader.read_i32::<LittleEndian>()?;
         let cooker_ver = reader.read_i32::<LittleEndian>()?;
-        let compression_method = 
+        let compression_method =
             CompressionMethod::try_from(reader.read_u32::<LittleEndian>()?).unwrap();
         let compressed_chunks_count = reader.read_u32::<LittleEndian>()?;
-        let mut compressed_chunks: Vec<CompressedChunk> = Vec::with_capacity(compressed_chunks_count as usize);
+        let mut compressed_chunks: Vec<CompressedChunk> =
+            Vec::with_capacity(compressed_chunks_count as usize);
 
         for _ in 0..compressed_chunks_count {
-            compressed_chunks.push(CompressedChunk{
+            compressed_chunks.push(CompressedChunk {
                 decompressed_offset: reader.read_u32::<LittleEndian>()?,
                 decompressed_size: reader.read_u32::<LittleEndian>()?,
                 compressed_offset: reader.read_u32::<LittleEndian>()?,
@@ -959,19 +1199,24 @@ impl UpkHeader {
 
         let package_source = reader.read_i32::<LittleEndian>()?;
 
-        let mut additional_packages = -1;
-        let mut texture_allocs = -1;
+        let additional_packages = if p_ver >= VER_ADDITIONAL_COOK_PACKAGE_SUMMARY {
+            let n = reader.read_i32::<LittleEndian>()?;
+            let mut v = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                v.push(read_fstring_stream(&mut reader)?);
+            }
+            v
+        } else {
+            Vec::new()
+        };
 
-        if p_ver >= 516 {
-            additional_packages = reader.read_i32::<LittleEndian>()?;
-        }
+        let texture_allocs = if p_ver >= VER_TEXTURE_PREALLOCATION {
+            FTextureAllocations::read(&mut reader)?
+        } else {
+            FTextureAllocations::default()
+        };
 
-        if p_ver >= 767 {
-            texture_allocs = reader.read_i32::<LittleEndian>()?;
-        }
-
-        let header = UpkHeader
-        {
+        let header = UpkHeader {
             sign,
             p_ver,
             l_ver,
@@ -1000,14 +1245,13 @@ impl UpkHeader {
             compressed_chunks,
             package_source,
             additional_packages,
-            texture_allocs
+            texture_allocs,
         };
 
         Ok(header)
     }
 
-    pub fn write<R: Write + Seek>(&self, mut writer: R) -> Result<()>
-    {
+    pub fn write<R: Write + Seek>(&self, mut writer: R) -> Result<()> {
         writer.write_u32::<LittleEndian>(self.sign)?;
         writer.write_i16::<LittleEndian>(self.p_ver)?;
         writer.write_i16::<LittleEndian>(self.l_ver)?;
@@ -1022,13 +1266,13 @@ impl UpkHeader {
         writer.write_i32::<LittleEndian>(self.import_count)?;
         writer.write_i32::<LittleEndian>(self.import_offset)?;
         writer.write_i32::<LittleEndian>(self.depends_offset)?;
-        
+
         if self.p_ver >= 623 {
             writer.write_i32::<LittleEndian>(self.import_export_guids_offset)?;
             writer.write_u32::<LittleEndian>(self.import_guids_count)?;
             writer.write_u32::<LittleEndian>(self.export_guids_count)?;
-        } 
-        if self.p_ver >= 584{ 
+        }
+        if self.p_ver >= 584 {
             writer.write_u32::<LittleEndian>(self.thumbnail_table_offest)?;
         }
 
@@ -1048,7 +1292,7 @@ impl UpkHeader {
         writer.write_i32::<LittleEndian>(self.cooker_ver)?;
         writer.write_u32::<LittleEndian>(self.compression_method as u32)?;
         writer.write_u32::<LittleEndian>(self.compressed_chunks_count)?;
-   
+
         if self.compressed_chunks_count > 0 {
             for c in &self.compressed_chunks {
                 writer.write_u32::<LittleEndian>(c.decompressed_offset)?;
@@ -1060,15 +1304,25 @@ impl UpkHeader {
 
         writer.write_i32::<LittleEndian>(self.package_source)?;
 
-        if self.p_ver >= 516 {
-            writer.write_i32::<LittleEndian>(self.additional_packages)?;
+        if self.p_ver >= VER_ADDITIONAL_COOK_PACKAGE_SUMMARY {
+            writer.write_i32::<LittleEndian>(self.additional_packages.len() as i32)?;
+            for s in &self.additional_packages {
+                write_fstring(&mut writer, s)?;
+            }
         }
 
-        if self.p_ver >= 767 {
-            writer.write_i32::<LittleEndian>(self.texture_allocs)?;
+        if self.p_ver >= VER_TEXTURE_PREALLOCATION {
+            self.texture_allocs.write(&mut writer)?;
         }
 
         Ok(())
     }
-}
 
+    pub fn has_flag(&self, flag: u32) -> bool {
+        (self.pak_flags & flag) != 0
+    }
+
+    pub fn strip_editor_only(&self) -> bool {
+        self.has_flag(PKG_FILTER_EDITOR_ONLY)
+    }
+}
