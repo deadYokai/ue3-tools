@@ -3,19 +3,47 @@
 pub const PACKAGE_FILE_TAG: u32 = 0x9E2A83C1;
 pub const PACKAGE_FILE_TAG_SWAPPED: u32 = 0xC1832A9E;
 
+pub const VER_FOBJECTEXPORT_EXPORTFLAGS: i16 = 247;
+pub const VER_REMOVED_COMPONENT_CLASS_BRIDGE: i16 = 248;
+pub const VER_MOVED_EXPORTIMPORTMAPS_ADDED_TOTALHEADERSIZE: i16 = 249;
+pub const VER_PACKAGEFILESUMMARY_CHANGE: i16 = 245;
+pub const VER_PACKAGEFILESUMMARY_CHANGE_COOK_VER_ADDED: i16 = 277;
+pub const VER_REPLACED_LAZY_ARRAY_WITH_UNTYPED_BULK_DATA: i16 = 266;
+pub const VER_FIXED_COMPONENT_TEMPLATES: i16 = 267;
+pub const VER_FOLDER_ADDED: i16 = 269;
+pub const VER_ADDED_PLATFORM_FLAGS: i16 = 276;
+pub const VER_CHANGED_INTERFACES_TO_MAP: i16 = 288;
+pub const VER_RENDERING_REFACTOR: i16 = 297;
+pub const VER_LINKERFREE_PACKAGEMAP: i16 = 322;
+pub const VER_ADDED_PACKAGE_COMPRESSION_SUPPORT: i16 = 334;
+pub const VER_FNAME_CHANGE_NAME_SPLIT: i16 = 343;
+pub const VER_NAME_TABLE_LOADING_CHANGE: i16 = 347;
+pub const VER_ADDED_LINKER_DEPENDENCIES: i16 = 415;
+
 pub const VER_ADDITIONAL_COOK_PACKAGE_SUMMARY: i16 = 516;
 pub const VER_REMOVED_COMPONENT_MAP: i16 = 543;
 pub const VER_ASSET_THUMBNAILS_IN_PACKAGES: i16 = 584;
 pub const VER_ADDED_TEXTURE_FILECACHE_GUIDS: i16 = 567;
+pub const VER_DONTSORTCATEGORIES_ADDED: i16 = 603;
 pub const VER_ADDED_CROSSLEVEL_REFERENCES: i16 = 623;
+pub const VER_ADDED_TEXTURE_ORIGINAL_SIZE: i16 = 627;
 pub const VER_BYTEPROP_SERIALIZE_ENUM: i16 = 633;
+pub const VER_ADDED_TEXTURE_INTERNALFORMATLODBIAS: i16 = 634;
 pub const VER_USTRUCT_SERIALIZE_ONDISK_SCRIPTSIZE: i16 = 639;
 pub const VER_SCRIPT_BIND_DLL_FUNCTIONS: i16 = 655;
 pub const VER_PROPERTYTAG_BOOL_OPTIMIZATION: i16 = 673;
+pub const VER_ADDED_CACHED_IPHONE_DATA: i16 = 674;
+pub const VER_NETINDEX_STORED_AS_INT: i16 = 684;
+pub const VER_REDUCED_PROBEMASK_REMOVED_IGNOREMASK: i16 = 691;
+pub const VER_FORCE_SCRIPT_DEFINED_ORDER_PER_CLASS: i16 = 749;
 pub const VER_MOVED_SUPERFIELD_TO_USTRUCT: i16 = 756;
 pub const VER_TEXTURE_PREALLOCATION: i16 = 767;
+pub const VER_ADDED_CLASS_GROUPS: i16 = 789;
 
-pub const VER_DISHONORED: i16 = 801;
+pub const VER_CLASS_HEADER_FILENAME_HEURISTIC: i16 = 850;
+pub const VER_VERSION_NUMBER_FIX_FOR_FLASH_TEXTURES: i16 = 857;
+pub const VER_FLASH_DXT5_TEXTURE_SUPPORT: i16 = 861;
+pub const VER_ANDROID_ETC_SEPARATED: i16 = 864;
 
 pub const PKG_ALLOW_DOWNLOAD: u32 = 0x00000001;
 pub const PKG_CLIENT_OPTIONAL: u32 = 0x00000002;
@@ -24,6 +52,18 @@ pub const PKG_COOKED: u32 = 0x00000008;
 pub const PKG_UNSECURE: u32 = 0x00000010;
 pub const PKG_SAVED_WITH_NEWER_VERSION: u32 = 0x00000020;
 pub const PKG_NEED: u32 = 0x00008000;
+pub const BULKDATA_NONE: u32 = 0;
+pub const BULKDATA_STORE_IN_SEPARATE_FILE: u32 = 1 << 0;
+pub const BULKDATA_SERIALIZE_COMPRESSED_ZLIB: u32 = 1 << 1;
+pub const BULKDATA_FORCE_SINGLE_ELEMENT_SERIAL: u32 = 1 << 2;
+pub const BULKDATA_SINGLE_USE: u32 = 1 << 3;
+pub const BULKDATA_SERIALIZE_COMPRESSED_LZO: u32 = 1 << 4;
+pub const BULKDATA_UNUSED: u32 = 1 << 5;
+pub const BULKDATA_STORE_ONLY_PAYLOAD: u32 = 1 << 6;
+pub const BULKDATA_SERIALIZE_COMPRESSED_LZX: u32 = 1 << 7;
+pub const BULKDATA_SERIALIZE_COMPRESSED: u32 = BULKDATA_SERIALIZE_COMPRESSED_ZLIB
+    | BULKDATA_SERIALIZE_COMPRESSED_LZO
+    | BULKDATA_SERIALIZE_COMPRESSED_LZX;
 pub const PKG_CONTAINS_MAP: u32 = 0x00020000;
 pub const PKG_TRASH: u32 = 0x00040000;
 pub const PKG_DISALLOW_LAZY_LOADING: u32 = 0x00100000;
@@ -50,3 +90,71 @@ pub const CPF_NATIVE: u64 = 0x0000000000001000;
 
 pub const RF_HAS_STACK: u64 = 0x0000000000020000;
 pub const RF_CLASS_DEFAULT_OBJECT: u64 = 0x0000000000000200;
+
+pub const FUNC_FINAL: u32 = 0x00000001;
+pub const FUNC_DEFINED: u32 = 0x00000002;
+pub const FUNC_ITERATOR: u32 = 0x00000004;
+pub const FUNC_LATENT: u32 = 0x00000008;
+pub const FUNC_PREOPERATOR: u32 = 0x00000010;
+pub const FUNC_SINGULAR: u32 = 0x00000020;
+pub const FUNC_NETRELIABLE: u32 = 0x00000080;
+pub const FUNC_SIMULATED: u32 = 0x00000100;
+pub const FUNC_EXEC: u32 = 0x00000200;
+pub const FUNC_EVENT: u32 = 0x00000800;
+pub const FUNC_OPERATOR: u32 = 0x00001000;
+pub const FUNC_STATIC: u32 = 0x00002000;
+pub const FUNC_HASOPTIONALPARMS: u32 = 0x00004000;
+pub const FUNC_CONST: u32 = 0x00008000;
+pub const FUNC_PUBLIC: u32 = 0x00020000;
+pub const FUNC_PRIVATE: u32 = 0x00040000;
+pub const FUNC_PROTECTED: u32 = 0x00080000;
+pub const FUNC_DELEGATE: u32 = 0x00100000;
+pub const FUNC_NETSERVER: u32 = 0x00200000;
+pub const FUNC_HASOUTPARMS: u32 = 0x00400000;
+pub const FUNC_NETCLIENT: u32 = 0x01000000;
+pub const FUNC_DLLIMPORT: u32 = 0x02000000;
+
+pub fn format_function_flags(flags: u32) -> String {
+    let pairs: &[(u32, &str)] = &[
+        (FUNC_FINAL, "Final"),
+        (FUNC_DEFINED, "Defined"),
+        (FUNC_ITERATOR, "Iterator"),
+        (FUNC_LATENT, "Latent"),
+        (FUNC_PREOPERATOR, "PreOperator"),
+        (FUNC_SINGULAR, "Singular"),
+        (FUNC_NET, "Net"),
+        (FUNC_NETRELIABLE, "NetReliable"),
+        (FUNC_SIMULATED, "Simulated"),
+        (FUNC_EXEC, "Exec"),
+        (FUNC_NATIVE, "Native"),
+        (FUNC_EVENT, "Event"),
+        (FUNC_OPERATOR, "Operator"),
+        (FUNC_STATIC, "Static"),
+        (FUNC_HASOPTIONALPARMS, "HasOptionalParms"),
+        (FUNC_CONST, "Const"),
+        (FUNC_PUBLIC, "Public"),
+        (FUNC_PRIVATE, "Private"),
+        (FUNC_PROTECTED, "Protected"),
+        (FUNC_DELEGATE, "Delegate"),
+        (FUNC_NETSERVER, "NetServer"),
+        (FUNC_HASOUTPARMS, "HasOutParms"),
+        (FUNC_HAS_DEFAULTS, "HasDefaults"),
+        (FUNC_NETCLIENT, "NetClient"),
+        (FUNC_DLLIMPORT, "DLLImport"),
+    ];
+    pairs
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, n)| *n)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+pub fn script_pointer_size(p_ver: i16) -> usize {
+    // if p_ver < VER_ADDITIONAL_COOK_PACKAGE_SUMMARY {
+    //     4
+    // } else {
+    //     8
+    // }
+    4
+}

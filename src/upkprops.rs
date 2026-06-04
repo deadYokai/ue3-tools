@@ -626,11 +626,7 @@ fn read_struct_value(
     sentry: &SchemaEntry,
     _owner_pak: &UPKPak,
 ) -> Result<PropertyValue> {
-    let immutable = matches!(
-        sentry,
-        SchemaEntry::ScriptStruct { struct_flags, .. }
-            if (struct_flags & (STRUCT_IMMUTABLE | STRUCT_IMMUTABLE_WHEN_COOKED)) != 0
-    );
+    let immutable = false;
     let child_ctx = ctx.with_owner(sref.clone());
 
     if immutable {

@@ -11,7 +11,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::{
     schema::{PropertyKind, SchemaEntry, SchemaParseCtx, parse_export_schema},
-    upkdecompress::{CompressionMethod, upk_decompress},
+    utils::decompress::{CompressionMethod, upk_decompress},
     upkreader::{FName, PackageFlags, UPKPak, UpkHeader},
     versions::VER_BYTEPROP_SERIALIZE_ENUM,
 };
@@ -91,7 +91,7 @@ impl LazyPackage {
     pub fn schema_ctx(&self) -> SchemaParseCtx {
         SchemaParseCtx {
             p_ver: self.header.p_ver,
-            strip_editor_only: self.header.strip_editor_only(),
+            cooked_for_console: false,
         }
     }
 
@@ -164,6 +164,11 @@ impl SchemaDb {
             eprintln!("  schemadb: {msg}");
         }
         self.misses.borrow_mut().push(msg);
+    }
+
+    pub fn fname_string(&self, in_pkg: &str, f: &FName) -> Option<String> {
+        let pkg = self.open_package(in_pkg).ok()?;
+        Some(pkg.pak.fname_to_string(f))
     }
 
     pub fn resolve_index(&self, pkg: &LazyPackage, idx: i32) -> Result<Option<ResolvedRef>> {
@@ -352,13 +357,9 @@ impl SchemaDb {
     ) -> Result<Vec<(String, ResolvedRef, Rc<SchemaEntry>)>> {
         let pkg = self.open_package(&r.stem_lc)?;
         let entry = self.entry(r)?;
-        let head = match &*entry {
-            SchemaEntry::Class { header, .. }
-            | SchemaEntry::State { header, .. }
-            | SchemaEntry::ScriptStruct { header, .. }
-            | SchemaEntry::Struct { header }
-            | SchemaEntry::Function { header, .. } => header.children,
-            _ => return Ok(Vec::new()),
+        let head = match entry.as_struct_header() {
+            Some(h) => h.children,
+            None => return Ok(Vec::new()),
         };
 
         let mut out = Vec::new();
@@ -406,14 +407,10 @@ impl SchemaDb {
             }
             let pkg = self.open_package(&cur.stem_lc)?;
             let entry = self.entry(&cur)?;
-            let super_idx = match &*entry {
-                SchemaEntry::Class { header, .. }
-                | SchemaEntry::State { header, .. }
-                | SchemaEntry::ScriptStruct { header, .. }
-                | SchemaEntry::Struct { header }
-                | SchemaEntry::Function { header, .. } => header.super_struct,
-                _ => 0,
-            };
+            let super_idx = entry
+                .as_struct_header()
+                .map(|h| h.super_struct)
+                .unwrap_or(0);
             if super_idx == 0 {
                 break;
             }
@@ -545,7 +542,10 @@ impl SchemaDb {
                     continue;
                 }
                 let cn = pkg.export_class_name(e1);
-                if cn != "ScriptStruct" && cn != "Struct" {
+                if !matches!(
+                    cn.as_str(),
+                    "ScriptStruct" | "Struct" | "Class" | "State" | "Function"
+                ) {
                     continue;
                 }
                 let r = ResolvedRef {
@@ -575,15 +575,7 @@ trait SchemaEntryNext {
 
 impl SchemaEntryNext for SchemaEntry {
     fn common_next(&self) -> i32 {
-        match self {
-            SchemaEntry::Property(p) => p.common().next,
-            SchemaEntry::Enum { next, .. } => *next,
-            SchemaEntry::Class { header, .. }
-            | SchemaEntry::State { header, .. }
-            | SchemaEntry::ScriptStruct { header, .. }
-            | SchemaEntry::Struct { header }
-            | SchemaEntry::Function { header, .. } => header.next,
-        }
+        SchemaEntry::next(self)
     }
 }
 

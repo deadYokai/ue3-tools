@@ -1,24 +1,30 @@
-use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
+use std::io::{Cursor, Error, ErrorKind, Result, Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 
 use crate::upkprops::parse_property;
-use crate::upkreader::{FName, UPKPak, read_string};
+use crate::upkreader::{FName, UPKPak, read_fstring_stream};
 use crate::versions::*;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SchemaParseCtx {
     pub p_ver: i16,
-    pub strip_editor_only: bool,
+    pub cooked_for_console: bool,
 }
 
 impl SchemaParseCtx {
-    pub fn from_package(pak: &UPKPak, p_ver: i16, strip_editor_only: bool) -> Self {
-        let _ = pak;
+    pub fn from_package(_pak: &UPKPak, p_ver: i16, _strip_editor_only: bool) -> Self {
         Self {
             p_ver,
-            strip_editor_only,
+            cooked_for_console: false,
+        }
+    }
+
+    pub fn pc(p_ver: i16) -> Self {
+        Self {
+            p_ver,
+            cooked_for_console: false,
         }
     }
 }
@@ -127,52 +133,110 @@ pub struct StructHeader {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionExtra {
+    pub i_native: u16,
+    pub oper_precedence: u8,
+    pub function_flags: u32,
+    pub rep_offset: Option<u16>,
+    pub friendly_name: Option<FName>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateExtra {
+    pub probe_mask: u32,
+    pub label_table_offset: u16,
+    pub state_flags: u32,
+    pub func_map: Vec<(FName, i32)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementedInterface {
+    pub class: i32,
+    pub pointer_property: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassExtra {
+    pub class_flags: u32,
+    pub class_within: i32,
+    pub class_config_name: FName,
+    pub component_name_to_default_object_map: Vec<(FName, i32)>,
+    pub interfaces: Vec<ImplementedInterface>,
+    pub dont_sort_categories: Option<Vec<FName>>,
+    pub hide_categories: Option<Vec<FName>>,
+    pub auto_expand_categories: Option<Vec<FName>>,
+    pub auto_collapse_categories: Option<Vec<FName>>,
+    pub b_force_script_order: Option<u32>,
+    pub class_group_names: Option<Vec<FName>>,
+    pub dll_bind_name: Option<FName>,
+    pub class_default_object: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptStructExtra {
+    pub struct_flags: u32,
+    pub default_props_offset_in_blob: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SchemaEntry {
-    Class {
-        header: StructHeader,
-        class_flags: u32,
-        class_within: i32,
-        class_config_name: FName,
-        component_name_to_default_object_map: Vec<(FName, i32)>,
-        interfaces: Vec<(i32, i32)>,
-        dont_sort_categories: Option<Vec<FName>>,
-        hide_categories: Option<Vec<FName>>,
-        auto_expand_categories: Option<Vec<FName>>,
-        auto_collapse_categories: Option<Vec<FName>>,
-        force_script_order: Option<bool>,
-        class_group_names: Option<Vec<FName>>,
-        class_header_filename: Option<String>,
-        dll_bind_name: Option<FName>,
-        class_default_object: i32,
-    },
-    State {
-        header: StructHeader,
-        probe_mask: u64,
-        label_table_offset: u16,
-        state_flags: u32,
-        func_map: Vec<(FName, i32)>,
-    },
-    ScriptStruct {
-        header: StructHeader,
-        struct_flags: u32,
-    },
     Struct {
         header: StructHeader,
     },
     Function {
         header: StructHeader,
-        i_native: u16,
-        oper_precedence: u8,
-        function_flags: u32,
-        rep_offset: Option<u16>,
-        friendly_name: Option<FName>,
+        extra: FunctionExtra,
+    },
+    State {
+        header: StructHeader,
+        extra: StateExtra,
+    },
+    Class {
+        header: StructHeader,
+        state: StateExtra,
+        extra: ClassExtra,
+    },
+    ScriptStruct {
+        header: StructHeader,
+        extra: ScriptStructExtra,
     },
     Enum {
         next: i32,
         super_field: Option<i32>,
         names: Vec<FName>,
     },
+    Const {
+        next: i32,
+        super_field: Option<i32>,
+        value: String,
+    },
     Property(PropertyKind),
+}
+
+impl SchemaEntry {
+    pub fn as_struct_header(&self) -> Option<&StructHeader> {
+        match self {
+            SchemaEntry::Struct { header }
+            | SchemaEntry::Function { header, .. }
+            | SchemaEntry::State { header, .. }
+            | SchemaEntry::Class { header, .. }
+            | SchemaEntry::ScriptStruct { header, .. } => Some(header),
+            _ => None,
+        }
+    }
+
+    pub fn next(&self) -> i32 {
+        match self {
+            SchemaEntry::Property(p) => p.common().next,
+            SchemaEntry::Enum { next, .. } => *next,
+            SchemaEntry::Const { next, .. } => *next,
+            SchemaEntry::Struct { header }
+            | SchemaEntry::Function { header, .. }
+            | SchemaEntry::State { header, .. }
+            | SchemaEntry::Class { header, .. }
+            | SchemaEntry::ScriptStruct { header, .. } => header.next,
+        }
+    }
 }
 
 pub fn parse_export_schema(
@@ -187,14 +251,21 @@ pub fn parse_export_schema(
     skip_object_prefix(&mut c, pak, ctx.p_ver)?;
 
     match class_name {
-        "Class" => Ok(Some(parse_class(&mut c, pak, ctx)?)),
-        "State" => Ok(Some(parse_state(&mut c, pak, ctx)?)),
-        "ScriptStruct" => Ok(Some(parse_script_struct(&mut c, pak, ctx)?)),
         "Struct" => Ok(Some(SchemaEntry::Struct {
             header: parse_struct_header(&mut c, pak, ctx)?,
         })),
+
+        "ScriptStruct" => Ok(Some(parse_script_struct(&mut c, pak, ctx)?)),
+
         "Function" => Ok(Some(parse_function(&mut c, pak, ctx)?)),
+
+        "State" => Ok(Some(parse_state(&mut c, pak, ctx)?)),
+
+        "Class" => Ok(Some(parse_class(&mut c, pak, ctx)?)),
+
         "Enum" => Ok(Some(parse_enum(&mut c, pak, ctx)?)),
+
+        "Const" => Ok(Some(parse_const(&mut c, pak, ctx)?)),
 
         "ByteProperty" => Ok(Some(SchemaEntry::Property(parse_byte_property(
             &mut c, ctx,
@@ -244,7 +315,9 @@ pub fn parse_export_schema(
 }
 
 fn skip_object_prefix(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, p_ver: i16) -> Result<()> {
-    let _net_index = c.read_i32::<LittleEndian>()?;
+    if p_ver >= VER_NETINDEX_STORED_AS_INT {
+        let _net_index = c.read_i32::<LittleEndian>()?;
+    }
 
     loop {
         let before = c.position();
@@ -283,7 +356,7 @@ fn parse_struct_header(
         pre_756_super.unwrap_or(0)
     };
 
-    let script_text = if !ctx.strip_editor_only {
+    let script_text = if !ctx.cooked_for_console {
         Some(c.read_i32::<LittleEndian>()?)
     } else {
         None
@@ -291,11 +364,11 @@ fn parse_struct_header(
 
     let children = c.read_i32::<LittleEndian>()?;
 
-    let (cpp_text, editor_line_pos) = if !ctx.strip_editor_only {
+    let (cpp_text, editor_line_pos) = if !ctx.cooked_for_console {
         let cpp = c.read_i32::<LittleEndian>()?;
         let line = c.read_i32::<LittleEndian>()?;
-        let tpos = c.read_i32::<LittleEndian>()?;
-        (Some(cpp), Some((line, tpos)))
+        let text_pos = c.read_i32::<LittleEndian>()?;
+        (Some(cpp), Some((line, text_pos)))
     } else {
         (None, None)
     };
@@ -309,6 +382,17 @@ fn parse_struct_header(
 
     let script_offset_in_blob = c.position();
     if on_disk_script_size > 0 {
+        let blob_len = c.get_ref().len() as i64;
+        let want = script_offset_in_blob as i64 + on_disk_script_size as i64;
+        if want > blob_len {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "UStruct bytecode (storage={}) overruns export blob (offset {} + size > {} bytes)",
+                    on_disk_script_size, script_offset_in_blob, blob_len
+                ),
+            ));
+        }
         c.seek(SeekFrom::Current(on_disk_script_size as i64))?;
     }
 
@@ -326,27 +410,43 @@ fn parse_struct_header(
     })
 }
 
-fn parse_script_struct(
+fn parse_function(
     c: &mut Cursor<&Vec<u8>>,
     pak: &UPKPak,
     ctx: SchemaParseCtx,
 ) -> Result<SchemaEntry> {
     let header = parse_struct_header(c, pak, ctx)?;
-    let struct_flags = c.read_u32::<LittleEndian>()?;
-    Ok(SchemaEntry::ScriptStruct {
+    let i_native = c.read_u16::<LittleEndian>()?;
+    let oper_precedence = c.read_u8()?;
+    let function_flags = c.read_u32::<LittleEndian>()?;
+    let rep_offset = if function_flags & FUNC_NET != 0 {
+        Some(c.read_u16::<LittleEndian>()?)
+    } else {
+        None
+    };
+    let friendly_name = if !ctx.cooked_for_console {
+        Some(read_fname(c)?)
+    } else {
+        None
+    };
+    Ok(SchemaEntry::Function {
         header,
-        struct_flags,
+        extra: FunctionExtra {
+            i_native,
+            oper_precedence,
+            function_flags,
+            rep_offset,
+            friendly_name,
+        },
     })
 }
 
-fn parse_state(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> Result<SchemaEntry> {
-    let header = parse_struct_header(c, pak, ctx)?;
-    let probe_mask = c.read_u64::<LittleEndian>()?;
+fn parse_state_extra(c: &mut Cursor<&Vec<u8>>) -> Result<StateExtra> {
+    let probe_mask = c.read_u32::<LittleEndian>()?;
     let label_table_offset = c.read_u16::<LittleEndian>()?;
     let state_flags = c.read_u32::<LittleEndian>()?;
     let func_map = read_fname_to_object_map(c)?;
-    Ok(SchemaEntry::State {
-        header,
+    Ok(StateExtra {
         probe_mask,
         label_table_offset,
         state_flags,
@@ -354,50 +454,59 @@ fn parse_state(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> R
     })
 }
 
+fn parse_state(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> Result<SchemaEntry> {
+    let header = parse_struct_header(c, pak, ctx)?;
+    let extra = parse_state_extra(c)?;
+    Ok(SchemaEntry::State { header, extra })
+}
+
 fn parse_class(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> Result<SchemaEntry> {
-    let SchemaEntry::State {
-        header,
-        probe_mask: _,
-        label_table_offset: _,
-        state_flags: _,
-        func_map: _,
-    } = parse_state(c, pak, ctx)?
-    else {
-        unreachable!()
-    };
+    let header = parse_struct_header(c, pak, ctx)?;
+    let state = parse_state_extra(c)?;
 
     let class_flags = c.read_u32::<LittleEndian>()?;
     let class_within = c.read_i32::<LittleEndian>()?;
     let class_config_name = read_fname(c)?;
     let component_name_to_default_object_map = read_fname_to_object_map(c)?;
-    let interfaces = read_object_to_object_map(c)?;
+    let interfaces = read_implemented_interfaces(c)?;
 
-    let mut dont_sort_categories = None;
-    let mut hide_categories = None;
-    let mut auto_expand_categories = None;
-    let mut auto_collapse_categories = None;
-    let mut force_script_order = None;
-    let mut class_group_names = None;
-    let mut class_header_filename = None;
-
-    if !ctx.strip_editor_only {
-        if ctx.p_ver >= 603 {
-            dont_sort_categories = Some(read_fname_array(c)?);
-        }
-        hide_categories = Some(read_fname_array(c)?);
-        auto_expand_categories = Some(read_fname_array(c)?);
-        auto_collapse_categories = Some(read_fname_array(c)?);
-
-        if ctx.p_ver >= 749 {
-            force_script_order = Some(c.read_i32::<LittleEndian>()? != 0);
-        }
-
-        if ctx.p_ver >= 789 {
-            class_group_names = Some(read_fname_array(c)?);
-        }
-
-        class_header_filename = Some(read_string(c)?);
-    }
+    let (
+        dont_sort_categories,
+        hide_categories,
+        auto_expand_categories,
+        auto_collapse_categories,
+        b_force_script_order,
+        class_group_names,
+    ) = if !ctx.cooked_for_console {
+        let dont_sort = if ctx.p_ver >= VER_DONTSORTCATEGORIES_ADDED {
+            Some(read_fname_array(c)?)
+        } else {
+            None
+        };
+        let hide = read_fname_array(c)?;
+        let auto_exp = read_fname_array(c)?;
+        let auto_col = read_fname_array(c)?;
+        let force_order = if ctx.p_ver >= VER_FORCE_SCRIPT_DEFINED_ORDER_PER_CLASS {
+            Some(c.read_u32::<LittleEndian>()?)
+        } else {
+            None
+        };
+        let groups = if ctx.p_ver >= VER_ADDED_CLASS_GROUPS {
+            Some(read_fname_array(c)?)
+        } else {
+            None
+        };
+        (
+            dont_sort,
+            Some(hide),
+            Some(auto_exp),
+            Some(auto_col),
+            force_order,
+            groups,
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
 
     let dll_bind_name = if ctx.p_ver >= VER_SCRIPT_BIND_DLL_FUNCTIONS {
         Some(read_fname(c)?)
@@ -409,51 +518,39 @@ fn parse_class(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> R
 
     Ok(SchemaEntry::Class {
         header,
-        class_flags,
-        class_within,
-        class_config_name,
-        component_name_to_default_object_map,
-        interfaces,
-        dont_sort_categories,
-        hide_categories,
-        auto_expand_categories,
-        auto_collapse_categories,
-        force_script_order,
-        class_group_names,
-        class_header_filename,
-        dll_bind_name,
-        class_default_object,
+        state,
+        extra: ClassExtra {
+            class_flags,
+            class_within,
+            class_config_name,
+            component_name_to_default_object_map,
+            interfaces,
+            dont_sort_categories,
+            hide_categories,
+            auto_expand_categories,
+            auto_collapse_categories,
+            b_force_script_order,
+            class_group_names,
+            dll_bind_name,
+            class_default_object,
+        },
     })
 }
 
-fn parse_function(
+fn parse_script_struct(
     c: &mut Cursor<&Vec<u8>>,
     pak: &UPKPak,
     ctx: SchemaParseCtx,
 ) -> Result<SchemaEntry> {
     let header = parse_struct_header(c, pak, ctx)?;
-
-    let i_native = c.read_u16::<LittleEndian>()?;
-    let oper_precedence = c.read_u8()?;
-    let function_flags = c.read_u32::<LittleEndian>()?;
-    let rep_offset = if function_flags & FUNC_NET != 0 {
-        Some(c.read_u16::<LittleEndian>()?)
-    } else {
-        None
-    };
-    let friendly_name = if !ctx.strip_editor_only {
-        Some(read_fname(c)?)
-    } else {
-        None
-    };
-
-    Ok(SchemaEntry::Function {
+    let struct_flags = c.read_u32::<LittleEndian>()?;
+    let default_props_offset_in_blob = c.position();
+    Ok(SchemaEntry::ScriptStruct {
         header,
-        i_native,
-        oper_precedence,
-        function_flags,
-        rep_offset,
-        friendly_name,
+        extra: ScriptStructExtra {
+            struct_flags,
+            default_props_offset_in_blob,
+        },
     })
 }
 
@@ -467,16 +564,34 @@ fn parse_enum(c: &mut Cursor<&Vec<u8>>, _pak: &UPKPak, ctx: SchemaParseCtx) -> R
     })
 }
 
+fn parse_const(
+    c: &mut Cursor<&Vec<u8>>,
+    _pak: &UPKPak,
+    ctx: SchemaParseCtx,
+) -> Result<SchemaEntry> {
+    let (next, super_field) = parse_field_prefix(c, ctx.p_ver)?;
+    let value = read_fstring_stream(c)?;
+    Ok(SchemaEntry::Const {
+        next,
+        super_field,
+        value,
+    })
+}
+
 fn parse_property_common(c: &mut Cursor<&Vec<u8>>, ctx: SchemaParseCtx) -> Result<PropertyCommon> {
     let (next, pre_756_super) = parse_field_prefix(c, ctx.p_ver)?;
 
     let array_dim = c.read_i32::<LittleEndian>()?;
     let property_flags = c.read_u64::<LittleEndian>()?;
-    let (category, array_size_enum) = if !ctx.strip_editor_only {
-        (Some(read_fname(c)?), Some(c.read_i32::<LittleEndian>()?))
+
+    let (category, array_size_enum) = if !ctx.cooked_for_console {
+        let cat = read_fname(c)?;
+        let aen = c.read_i32::<LittleEndian>()?;
+        (Some(cat), Some(aen))
     } else {
         (None, None)
     };
+
     let rep_offset = if property_flags & CPF_NET != 0 {
         Some(c.read_u16::<LittleEndian>()?)
     } else {
@@ -637,6 +752,45 @@ fn read_fname_to_object_map(c: &mut Cursor<&Vec<u8>>) -> Result<Vec<(FName, i32)
     Ok(v)
 }
 
+fn read_implemented_interfaces(c: &mut Cursor<&Vec<u8>>) -> Result<Vec<ImplementedInterface>> {
+    let n = c.read_i32::<LittleEndian>()?;
+    if !(0..=0x10_0000).contains(&n) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("TArray<FImplementedInterface>: implausible count {}", n),
+        ));
+    }
+    let mut v = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let class = c.read_i32::<LittleEndian>()?;
+        let pointer_property = c.read_i32::<LittleEndian>()?;
+        v.push(ImplementedInterface {
+            class,
+            pointer_property,
+        });
+    }
+    Ok(v)
+}
+
+#[allow(dead_code)]
+fn read_object_to_fname_map(c: &mut Cursor<&Vec<u8>>) -> Result<Vec<(i32, FName)>> {
+    let n = c.read_i32::<LittleEndian>()?;
+    if !(0..=0x10_0000).contains(&n) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("TMap<Object*,FName>: implausible count {}", n),
+        ));
+    }
+    let mut v = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let k = c.read_i32::<LittleEndian>()?;
+        let val = read_fname(c)?;
+        v.push((k, val));
+    }
+    Ok(v)
+}
+
+#[allow(dead_code)]
 fn read_object_to_object_map(c: &mut Cursor<&Vec<u8>>) -> Result<Vec<(i32, i32)>> {
     let n = c.read_i32::<LittleEndian>()?;
     if !(0..=0x10_0000).contains(&n) {
@@ -654,16 +808,24 @@ fn read_object_to_object_map(c: &mut Cursor<&Vec<u8>>) -> Result<Vec<(i32, i32)>
     Ok(v)
 }
 
-pub fn collect_children(entry: &SchemaEntry, pak: &UPKPak) -> Option<Vec<i32>> {
-    let head = match entry {
-        SchemaEntry::Class { header, .. } => header.children,
-        SchemaEntry::State { header, .. } => header.children,
-        SchemaEntry::ScriptStruct { header, .. } => header.children,
-        SchemaEntry::Struct { header, .. } => header.children,
-        SchemaEntry::Function { header, .. } => header.children,
-        _ => return None,
-    };
+#[allow(dead_code)]
+fn read_object_array(c: &mut Cursor<&Vec<u8>>) -> Result<Vec<i32>> {
+    let n = c.read_i32::<LittleEndian>()?;
+    if !(0..=0x10_0000).contains(&n) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("TArray<Object*>: implausible count {}", n),
+        ));
+    }
+    let mut v = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        v.push(c.read_i32::<LittleEndian>()?);
+    }
+    Ok(v)
+}
 
+pub fn collect_children(entry: &SchemaEntry, pak: &UPKPak) -> Option<Vec<i32>> {
+    let head = entry.as_struct_header()?.children;
     let mut out = Vec::new();
     let cur = head;
     let mut guard = 0;

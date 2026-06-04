@@ -7,21 +7,25 @@ use std::{
 };
 
 use crate::{
+    native::{NativePayload, NativeRead, NativeReadCtx, NativeRegistry},
+    pseudo::EmitInput,
     schemadb::{ResolvedRef, SchemaDb},
-    upkdecompress::{CompressedChunk, CompressionMethod},
     upkprops::{self, Property, PropertyCtx, PropertyValue, parse_property_ctx},
+    utils::decompress::{CompressedChunk, CompressionMethod},
     versions::{
-        PKG_FILTER_EDITOR_ONLY, VER_ADDITIONAL_COOK_PACKAGE_SUMMARY, VER_TEXTURE_PREALLOCATION,
+        PACKAGE_FILE_TAG, PKG_FILTER_EDITOR_ONLY, VER_ADDED_CROSSLEVEL_REFERENCES,
+        VER_ADDED_LINKER_DEPENDENCIES, VER_ADDED_PACKAGE_COMPRESSION_SUPPORT,
+        VER_ADDITIONAL_COOK_PACKAGE_SUMMARY, VER_ASSET_THUMBNAILS_IN_PACKAGES,
+        VER_FOBJECTEXPORT_EXPORTFLAGS, VER_LINKERFREE_PACKAGEMAP,
+        VER_MOVED_EXPORTIMPORTMAPS_ADDED_TOTALHEADERSIZE, VER_NETINDEX_STORED_AS_INT,
+        VER_PACKAGEFILESUMMARY_CHANGE, VER_PACKAGEFILESUMMARY_CHANGE_COOK_VER_ADDED,
+        VER_REMOVED_COMPONENT_MAP, VER_TEXTURE_PREALLOCATION,
     },
 };
 use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ron::ser::{PrettyConfig, to_string_pretty};
 use serde::{Deserialize, Serialize};
-
-use crate::scriptdisasm::{disasm_function, extract_script_from_export_blob, print_disasm};
-
-pub const PACKAGE_TAG: u32 = 0x9E2A83C1;
 
 bitflags! {
     pub struct PackageFlags: u32 {
@@ -164,10 +168,15 @@ impl Export {
         let object_flags = cursor.read_u64::<LittleEndian>()?;
 
         let serial_size = cursor.read_i32::<LittleEndian>()?;
-        let serial_offset = cursor.read_i32::<LittleEndian>()?;
+        let serial_offset =
+            if serial_size != 0 || ver >= VER_MOVED_EXPORTIMPORTMAPS_ADDED_TOTALHEADERSIZE {
+                cursor.read_i32::<LittleEndian>()?
+            } else {
+                0
+            };
 
         let mut legacy_component_map: HashMap<FName, i32> = HashMap::new();
-        if ver < 543 {
+        if ver < VER_REMOVED_COMPONENT_MAP {
             let count = cursor.read_i32::<LittleEndian>()?;
             for _ in 0..count {
                 let k = FName {
@@ -179,21 +188,34 @@ impl Export {
             }
         }
 
-        let export_flags = cursor.read_u32::<LittleEndian>()?;
+        let export_flags = if ver >= VER_FOBJECTEXPORT_EXPORTFLAGS {
+            cursor.read_u32::<LittleEndian>()?
+        } else {
+            0
+        };
 
-        let gen_count = cursor.read_i32::<LittleEndian>()?;
-        let mut generation_net_object_count = Vec::with_capacity(gen_count as usize);
-        for _ in 0..gen_count {
-            generation_net_object_count.push(cursor.read_i32::<LittleEndian>()?);
-        }
+        let (generation_net_object_count, package_guid) = if ver >= VER_LINKERFREE_PACKAGEMAP {
+            let gen_count = cursor.read_i32::<LittleEndian>()?;
+            let mut gnoc = Vec::with_capacity(gen_count as usize);
+            for _ in 0..gen_count {
+                gnoc.push(cursor.read_i32::<LittleEndian>()?);
+            }
+            let guid = [
+                cursor.read_i32::<LittleEndian>()?,
+                cursor.read_i32::<LittleEndian>()?,
+                cursor.read_i32::<LittleEndian>()?,
+                cursor.read_i32::<LittleEndian>()?,
+            ];
+            (gnoc, guid)
+        } else {
+            (Vec::new(), [0; 4])
+        };
 
-        let package_guid = [
-            cursor.read_i32::<LittleEndian>()?,
-            cursor.read_i32::<LittleEndian>()?,
-            cursor.read_i32::<LittleEndian>()?,
-            cursor.read_i32::<LittleEndian>()?,
-        ];
-        let package_flags = cursor.read_u32::<LittleEndian>()?;
+        let package_flags = if ver >= VER_REMOVED_COMPONENT_MAP {
+            cursor.read_u32::<LittleEndian>()?
+        } else {
+            0
+        };
 
         Ok(Self {
             class_index,
@@ -630,6 +652,31 @@ impl UPKPak {
             .collect::<Vec<_>>()
             .join("/")
     }
+
+    pub fn is_member_of_struct(&self, export_idx_1based: i32) -> bool {
+        let mut cur = export_idx_1based;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 64 {
+                return false;
+            }
+            let exp = match self.export_table.get((cur - 1) as usize) {
+                Some(e) => e,
+                None => return false,
+            };
+            if exp.outer_index <= 0 {
+                return false;
+            }
+            let outer = &self.export_table[(exp.outer_index - 1) as usize];
+            let outer_class = self.get_class_name(outer.class_index);
+            match outer_class.as_str() {
+                "Class" | "State" | "ScriptStruct" | "Struct" | "Function" => return true,
+                _ => {}
+            }
+            cur = exp.outer_index;
+        }
+    }
 }
 
 pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String> {
@@ -642,127 +689,80 @@ pub fn write_extracted_file(
     path: &Path,
     buf: &[u8],
     pkg: &UPKPak,
-    ver: i16,
+    pkg_stem: &str,
+    p_ver: i16,
     db: Option<&SchemaDb>,
-    owner: Option<ResolvedRef>,
+    owner_class_ref: Option<ResolvedRef>,
+    self_ref: Option<ResolvedRef>,
+    export_index: i32,
+    export_full_path: &str,
+    registry: &NativeRegistry,
 ) -> Result<PathBuf> {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("obj");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
     let dir = path.parent().unwrap();
-    let mut new_path = dir.join(name);
+    std::fs::create_dir_all(dir)?;
 
-    match ext {
-        "Function" | "ScriptFunction" => {
-            let mut out_file = File::create(path)?;
-            out_file.write_all(buf)?;
-            new_path = path.to_path_buf();
+    let buf_vec = buf.to_vec();
+    let mut cursor = Cursor::new(&buf_vec);
 
-            match extract_script_from_export_blob(buf, pkg) {
-                Some(script) => {
-                    let stmts = disasm_function(&script, pkg);
-                    if !stmts.is_empty() {
-                        let text = print_disasm(&stmts);
-                        let asm_path = path.with_extension("asm");
-                        let mut asm_file = File::create(&asm_path)?;
-                        asm_file.write_all(text.as_bytes())?;
-                        println!(
-                            "  \x1b[36mdisasm\x1b[0m → \x1b[32m{}\x1b[0m  ({} stmts)",
-                            asm_path.display(),
-                            stmts.len()
-                        );
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "  \x1b[33mwarn\x1b[0m: could not locate Script in {}",
-                        path.display()
-                    );
-                }
+    let net_index = if p_ver >= VER_NETINDEX_STORED_AS_INT {
+        Some(cursor.read_i32::<LittleEndian>()?)
+    } else {
+        None
+    };
+
+    let (props, props_end) =
+        get_obj_props_with_db(&mut cursor, pkg, false, p_ver, db, owner_class_ref.clone())?;
+
+    let tail = &buf_vec[props_end as usize..];
+
+    let ser = registry.for_class(db, owner_class_ref.as_ref(), ext);
+    let read = match &ser {
+        Some(s) => s.read(&NativeReadCtx {
+            blob: tail,
+            props: &props,
+            ver: p_ver,
+            l_ver: 0,
+            pak: pkg,
+            db,
+            self_ref: self_ref.clone(),
+            class_ref: owner_class_ref.clone(),
+        })?,
+        None => NativeRead::just(if tail.is_empty() {
+            NativePayload::Empty { tail: Vec::new() }
+        } else {
+            NativePayload::Raw {
+                bytes: tail.to_vec(),
             }
-        }
+        }),
+    };
 
-        "SwfMovie" | "GFxMovieInfo" => {
-            let buf_vec = buf.to_vec();
-            let mut cursor = Cursor::new(&buf_vec);
-            let (mut props, _) = get_obj_props(&mut cursor, pkg, false, ver)?;
+    let sidecars = match &ser {
+        Some(s) => s.emit_external(&read.payload, dir, name)?,
+        None => Vec::new(),
+    };
 
-            let rawdata_bytes: Option<Vec<u8>> = props
-                .iter()
-                .find(|p| p.name == "RawData")
-                .and_then(|p| p.value.as_vec())
-                .map(|arr| arr.iter().filter_map(|el| el.as_byte()).collect());
+    let uo_path = dir.join(format!("{name}.uo"));
+    crate::pseudo::write_uo_file(
+        &uo_path,
+        &EmitInput {
+            class_name: ext,
+            export_short_name: name,
+            export_full_path,
+            export_index,
+            net_index,
+            props: &props,
+            consumed_props: &read.consumed_props,
+            payload: &read.payload,
+            sidecars: &sidecars,
+            pak: pkg,
+            pkg_stem,
+            p_ver,
+        },
+    )?;
 
-            if let Some(bytes) = rawdata_bytes.filter(|b| !b.is_empty()) {
-                // Replace the RawData value with a filename reference.
-                for prop in props.iter_mut() {
-                    if prop.name == "RawData" {
-                        prop.value = PropertyValue::String(format!("{}.gfx", name));
-                    }
-                }
-                resolve_object_refs(&mut props, pkg);
-
-                let ron_string = to_string_pretty(
-                    &(format!("{}.{}", name, ext), &props),
-                    PrettyConfig::new().struct_names(true),
-                )
-                .unwrap();
-
-                new_path = new_path.with_extension("ron");
-                writeln!(File::create(&new_path)?, "{ron_string}")?;
-
-                let gfx_path = dir.join(format!("{}.gfx", name));
-                File::create(&gfx_path)?.write_all(&bytes)?;
-            } else {
-                let mut out_file = File::create(path)?;
-                out_file.write_all(buf)?;
-                new_path = path.to_path_buf();
-            }
-        }
-
-        _ => {
-            let buf_vec = buf.to_vec();
-            let mut cursor = Cursor::new(&buf_vec);
-
-            let (mut props, props_end) =
-                get_obj_props_with_db(&mut cursor, pkg, false, ver, db, owner.clone())?;
-
-            let tail = &buf_vec[props_end as usize..];
-
-            resolve_object_refs(&mut props, pkg);
-
-            let config = PrettyConfig::new().struct_names(true);
-
-            if !props.is_empty() && !(props.len() == 1 && props[0].name == "None") {
-                if !tail.is_empty() {
-                    let bin_name = format!("{}.bin", name);
-                    let bin_path = dir.join(&bin_name);
-                    File::create(&bin_path)?.write_all(tail)?;
-                    println!(
-                        "  \x1b[35mbinary\x1b[0m → \x1b[32m{}\x1b[0m  ({} bytes)",
-                        bin_path.display(),
-                        tail.len()
-                    );
-
-                    let ron_string =
-                        to_string_pretty(&(format!("{}.{}", name, ext), &props, &bin_name), config)
-                            .unwrap();
-                    new_path = new_path.with_extension("ron");
-                    writeln!(File::create(&new_path)?, "{ron_string}")?;
-                } else {
-                    let ron_string =
-                        to_string_pretty(&(format!("{}.{}", name, ext), &props), config).unwrap();
-                    new_path = new_path.with_extension("ron");
-                    writeln!(File::create(&new_path)?, "{ron_string}")?;
-                }
-            } else {
-                let mut out_file = File::create(path)?;
-                out_file.write_all(buf)?;
-                new_path = path.to_path_buf();
-            }
-        }
-    }
-
-    Ok(new_path)
+    Ok(uo_path)
 }
 
 pub fn extract_by_name(
@@ -775,55 +775,72 @@ pub fn extract_by_name(
     db: Option<&SchemaDb>,
     pkg_stem_lc: &str,
 ) -> Result<()> {
+    let registry = NativeRegistry::standard();
     let mut found = false;
 
     for (idx, exp) in pkg.export_table.iter().enumerate() {
-        let full_name = pkg.get_export_full_name((idx + 1) as i32);
-
+        let export_idx_1 = (idx + 1) as i32;
+        let full_name = pkg.get_export_full_name(export_idx_1);
         let fs_path = UPKPak::ue_name_to_path(&full_name);
 
-        if fs_path.contains(path) || full_name.contains(path) || all {
-            let exp = &pkg.export_table[idx];
-
-            let file_path = out_dir.join(&fs_path);
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            cursor.seek(std::io::SeekFrom::Start(exp.serial_offset as u64))?;
-            let mut buffer = vec![0u8; exp.serial_size as usize];
-            cursor.read_exact(&mut buffer)?;
-            let class_ref = if exp.class_index > 0 {
-                Some(ResolvedRef {
-                    stem_lc: pkg_stem_lc.to_string(),
-                    export_idx: exp.class_index,
-                })
-            } else if exp.class_index < 0 {
-                db.and_then(|d| {
-                    d.open_package(pkg_stem_lc)
-                        .ok()
-                        .and_then(|lp| d.resolve_index(&lp, exp.class_index).ok().flatten())
-                })
-            } else {
-                None
-            };
-
-            let out_path = write_extracted_file(&file_path, &buffer, pkg, ver, db, class_ref)?;
-
-            println!(
-                "Exported \x1b[93m{}\x1b[0m (\x1b[33m{}\x1b[0m bytes) to\n\t \x1b[32m{}\x1b[0m",
-                full_name,
-                buffer.len(),
-                out_path.display()
-            );
-            found = true;
+        if !(fs_path.contains(path) || full_name.contains(path) || all) {
+            continue;
         }
-    }
 
+        let file_path = out_dir.join(&fs_path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        cursor.seek(std::io::SeekFrom::Start(exp.serial_offset as u64))?;
+        let mut buffer = vec![0u8; exp.serial_size as usize];
+        cursor.read_exact(&mut buffer)?;
+
+        let class_ref = if exp.class_index > 0 {
+            Some(ResolvedRef {
+                stem_lc: pkg_stem_lc.into(),
+                export_idx: exp.class_index,
+            })
+        } else if exp.class_index < 0 {
+            db.and_then(|d| {
+                d.open_package(pkg_stem_lc)
+                    .ok()
+                    .and_then(|lp| d.resolve_index(&lp, exp.class_index).ok().flatten())
+            })
+        } else {
+            None
+        };
+
+        let self_ref = Some(ResolvedRef {
+            stem_lc: pkg_stem_lc.into(),
+            export_idx: export_idx_1,
+        });
+
+        let out_path = write_extracted_file(
+            &file_path,
+            &buffer,
+            pkg,
+            pkg_stem_lc,
+            ver,
+            db,
+            class_ref,
+            self_ref,
+            export_idx_1,
+            &full_name,
+            &registry,
+        )?;
+
+        println!(
+            "Exported \x1b[93m{}\x1b[0m (\x1b[33m{}\x1b[0m bytes) → \x1b[32m{}\x1b[0m",
+            full_name,
+            buffer.len(),
+            out_path.display()
+        );
+        found = true;
+    }
     if !found {
-        println!("File {} not exists in package.", path);
+        println!("File {path} not exists in package.");
     }
-
     Ok(())
 }
 
@@ -983,7 +1000,6 @@ pub fn get_obj_props_with_db(
     };
     let mut props = Vec::new();
     let mut last_pos = cursor.position();
-
     loop {
         let before = cursor.position();
         let result = parse_property_ctx(cursor, &ctx);
@@ -1011,6 +1027,17 @@ pub fn get_obj_props_with_db(
     }
     Ok((props, cursor.position()))
 }
+pub fn get_obj_props_with_netindex(
+    cursor: &mut Cursor<&Vec<u8>>,
+    upk: &UPKPak,
+    print_out: bool,
+    ver: i16,
+    db: Option<&SchemaDb>,
+    owner: Option<ResolvedRef>,
+) -> Result<(Vec<Property>, u64)> {
+    let _net = cursor.read_i32::<LittleEndian>()?;
+    get_obj_props_with_db(cursor, upk, print_out, ver, db, owner)
+}
 
 impl fmt::Display for UpkHeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1024,7 +1051,7 @@ impl fmt::Display for UpkHeader {
         writeln!(f, "Name Count: {}", self.name_count)?;
         writeln!(f, "Export Count: {}", self.export_count)?;
         writeln!(f, "Import Count: {}", self.import_count)?;
-        if self.p_ver >= 623 {
+        if self.p_ver >= VER_ADDED_CROSSLEVEL_REFERENCES {
             writeln!(
                 f,
                 "Import/Export Guids pos: {}",
@@ -1033,7 +1060,7 @@ impl fmt::Display for UpkHeader {
             writeln!(f, "Import Guids Count: {}", self.import_guids_count)?;
             writeln!(f, "Export Guids Count: {}", self.export_guids_count)?;
         }
-        if self.p_ver >= 584 {
+        if self.p_ver >= VER_ASSET_THUMBNAILS_IN_PACKAGES {
             writeln!(f, "Thumbnail table pos: {}", self.thumbnail_table_offest)?;
         }
         writeln!(f, "GUID: {:x?}", self.guid)?;
@@ -1114,7 +1141,7 @@ impl fmt::Display for UpkHeader {
 impl UpkHeader {
     pub fn read<R: Read + Seek>(mut reader: R) -> Result<Self> {
         let sign = reader.read_u32::<LittleEndian>()?;
-        if sign != PACKAGE_TAG {
+        if sign != PACKAGE_FILE_TAG {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("Invalid file signature, sig=0x{:X}", sign),
@@ -1141,7 +1168,11 @@ impl UpkHeader {
         let export_offset = reader.read_i32::<LittleEndian>()?;
         let import_count = reader.read_i32::<LittleEndian>()?;
         let import_offset = reader.read_i32::<LittleEndian>()?;
-        let depends_offset = reader.read_i32::<LittleEndian>()?;
+        let depends_offset = if p_ver >= VER_ADDED_LINKER_DEPENDENCIES {
+            reader.read_i32::<LittleEndian>()?
+        } else {
+            0
+        };
 
         if import_count <= 0 || name_count <= 0 || export_count <= 0 {
             return Err(Error::new(ErrorKind::InvalidData, "Corrupted pak"));
@@ -1152,13 +1183,13 @@ impl UpkHeader {
         let mut export_guids_count = 0;
         let mut thumbnail_table_offest = 0;
 
-        if p_ver >= 623 {
+        if p_ver >= VER_ADDED_CROSSLEVEL_REFERENCES {
             import_export_guids_offset = reader.read_i32::<LittleEndian>()?;
             import_guids_count = reader.read_u32::<LittleEndian>()?;
             export_guids_count = reader.read_u32::<LittleEndian>()?;
         }
 
-        if p_ver >= 584 {
+        if p_ver >= VER_ASSET_THUMBNAILS_IN_PACKAGES {
             thumbnail_table_offest = reader.read_u32::<LittleEndian>()?;
         }
 
@@ -1173,31 +1204,54 @@ impl UpkHeader {
         let mut gens = Vec::with_capacity(gen_count as usize);
 
         for _ in 0..gen_count {
+            let export_count = reader.read_i32::<LittleEndian>()?;
+            let name_count = reader.read_i32::<LittleEndian>()?;
+            let net_obj_count = if p_ver >= VER_LINKERFREE_PACKAGEMAP {
+                reader.read_i32::<LittleEndian>()?
+            } else {
+                0
+            };
             gens.push(GenerationInfo {
-                export_count: reader.read_i32::<LittleEndian>()?,
-                name_count: reader.read_i32::<LittleEndian>()?,
-                net_obj_count: reader.read_i32::<LittleEndian>()?,
+                export_count,
+                name_count,
+                net_obj_count,
             });
         }
 
-        let engine_ver = reader.read_i32::<LittleEndian>()?;
-        let cooker_ver = reader.read_i32::<LittleEndian>()?;
-        let compression_method =
-            CompressionMethod::try_from(reader.read_u32::<LittleEndian>()?).unwrap();
-        let compressed_chunks_count = reader.read_u32::<LittleEndian>()?;
-        let mut compressed_chunks: Vec<CompressedChunk> =
-            Vec::with_capacity(compressed_chunks_count as usize);
+        let engine_ver = if p_ver >= VER_PACKAGEFILESUMMARY_CHANGE {
+            reader.read_i32::<LittleEndian>()?
+        } else {
+            0
+        };
+        let cooker_ver = if p_ver >= VER_PACKAGEFILESUMMARY_CHANGE_COOK_VER_ADDED {
+            reader.read_i32::<LittleEndian>()?
+        } else {
+            0
+        };
 
-        for _ in 0..compressed_chunks_count {
-            compressed_chunks.push(CompressedChunk {
-                decompressed_offset: reader.read_u32::<LittleEndian>()?,
-                decompressed_size: reader.read_u32::<LittleEndian>()?,
-                compressed_offset: reader.read_u32::<LittleEndian>()?,
-                compressed_size: reader.read_u32::<LittleEndian>()?,
-            });
-        }
+        let (compression_method, compressed_chunks_count, compressed_chunks) =
+            if p_ver >= VER_ADDED_PACKAGE_COMPRESSION_SUPPORT {
+                let m = CompressionMethod::try_from(reader.read_u32::<LittleEndian>()?).unwrap();
+                let n = reader.read_u32::<LittleEndian>()?;
+                let mut v: Vec<CompressedChunk> = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    v.push(CompressedChunk {
+                        decompressed_offset: reader.read_u32::<LittleEndian>()?,
+                        decompressed_size: reader.read_u32::<LittleEndian>()?,
+                        compressed_offset: reader.read_u32::<LittleEndian>()?,
+                        compressed_size: reader.read_u32::<LittleEndian>()?,
+                    });
+                }
+                (m, n, v)
+            } else {
+                (CompressionMethod::None, 0, Vec::new())
+            };
 
-        let package_source = reader.read_i32::<LittleEndian>()?;
+        let package_source = if p_ver >= VER_ADDED_PACKAGE_COMPRESSION_SUPPORT {
+            reader.read_i32::<LittleEndian>()?
+        } else {
+            0
+        };
 
         let additional_packages = if p_ver >= VER_ADDITIONAL_COOK_PACKAGE_SUMMARY {
             let n = reader.read_i32::<LittleEndian>()?;
@@ -1265,14 +1319,16 @@ impl UpkHeader {
         writer.write_i32::<LittleEndian>(self.export_offset)?;
         writer.write_i32::<LittleEndian>(self.import_count)?;
         writer.write_i32::<LittleEndian>(self.import_offset)?;
-        writer.write_i32::<LittleEndian>(self.depends_offset)?;
+        if self.p_ver >= VER_ADDED_LINKER_DEPENDENCIES {
+            writer.write_i32::<LittleEndian>(self.depends_offset)?;
+        }
 
-        if self.p_ver >= 623 {
+        if self.p_ver >= VER_ADDED_CROSSLEVEL_REFERENCES {
             writer.write_i32::<LittleEndian>(self.import_export_guids_offset)?;
             writer.write_u32::<LittleEndian>(self.import_guids_count)?;
             writer.write_u32::<LittleEndian>(self.export_guids_count)?;
         }
-        if self.p_ver >= 584 {
+        if self.p_ver >= VER_ASSET_THUMBNAILS_IN_PACKAGES {
             writer.write_u32::<LittleEndian>(self.thumbnail_table_offest)?;
         }
 
@@ -1285,24 +1341,34 @@ impl UpkHeader {
         for g in &self.gens {
             writer.write_i32::<LittleEndian>(g.export_count)?;
             writer.write_i32::<LittleEndian>(g.name_count)?;
-            writer.write_i32::<LittleEndian>(g.net_obj_count)?;
-        }
-
-        writer.write_i32::<LittleEndian>(self.engine_ver)?;
-        writer.write_i32::<LittleEndian>(self.cooker_ver)?;
-        writer.write_u32::<LittleEndian>(self.compression_method as u32)?;
-        writer.write_u32::<LittleEndian>(self.compressed_chunks_count)?;
-
-        if self.compressed_chunks_count > 0 {
-            for c in &self.compressed_chunks {
-                writer.write_u32::<LittleEndian>(c.decompressed_offset)?;
-                writer.write_u32::<LittleEndian>(c.decompressed_size)?;
-                writer.write_u32::<LittleEndian>(c.compressed_offset)?;
-                writer.write_u32::<LittleEndian>(c.compressed_size)?;
+            if self.p_ver >= VER_LINKERFREE_PACKAGEMAP {
+                writer.write_i32::<LittleEndian>(g.net_obj_count)?;
             }
         }
 
-        writer.write_i32::<LittleEndian>(self.package_source)?;
+        if self.p_ver >= VER_PACKAGEFILESUMMARY_CHANGE {
+            writer.write_i32::<LittleEndian>(self.engine_ver)?;
+        }
+        if self.p_ver >= VER_PACKAGEFILESUMMARY_CHANGE_COOK_VER_ADDED {
+            writer.write_i32::<LittleEndian>(self.cooker_ver)?;
+        }
+
+        if self.p_ver >= VER_ADDED_PACKAGE_COMPRESSION_SUPPORT {
+            writer.write_u32::<LittleEndian>(self.compression_method as u32)?;
+            writer.write_u32::<LittleEndian>(self.compressed_chunks_count)?;
+            if self.compressed_chunks_count > 0 {
+                for c in &self.compressed_chunks {
+                    writer.write_u32::<LittleEndian>(c.decompressed_offset)?;
+                    writer.write_u32::<LittleEndian>(c.decompressed_size)?;
+                    writer.write_u32::<LittleEndian>(c.compressed_offset)?;
+                    writer.write_u32::<LittleEndian>(c.compressed_size)?;
+                }
+            }
+        }
+
+        if self.p_ver >= VER_ADDED_PACKAGE_COMPRESSION_SUPPORT {
+            writer.write_i32::<LittleEndian>(self.package_source)?;
+        }
 
         if self.p_ver >= VER_ADDITIONAL_COOK_PACKAGE_SUMMARY {
             writer.write_i32::<LittleEndian>(self.additional_packages.len() as i32)?;
@@ -1320,9 +1386,5 @@ impl UpkHeader {
 
     pub fn has_flag(&self, flag: u32) -> bool {
         (self.pak_flags & flag) != 0
-    }
-
-    pub fn strip_editor_only(&self) -> bool {
-        self.has_flag(PKG_FILTER_EDITOR_ONLY)
     }
 }

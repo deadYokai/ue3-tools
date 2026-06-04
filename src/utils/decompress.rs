@@ -1,9 +1,9 @@
-use std::{io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom}};
+use std::io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 
-use crate::upkreader::PACKAGE_TAG;
+use crate::versions::PACKAGE_FILE_TAG;
 
 pub const CHUNK_SIZE: u32 = 131072; // default in Unreal Engine 3
 
@@ -13,16 +13,15 @@ pub enum CompressionMethod {
     None,
     Zlib,
     Lzo,
-    Lzx = 4
+    Lzx = 4,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Copy)]
-pub struct CompressedChunk
-{
+pub struct CompressedChunk {
     pub decompressed_offset: u32,
     pub decompressed_size: u32,
     pub compressed_offset: u32,
-    pub compressed_size: u32
+    pub compressed_size: u32,
 }
 
 impl TryFrom<u32> for CompressionMethod {
@@ -34,7 +33,7 @@ impl TryFrom<u32> for CompressionMethod {
             1 => Ok(CompressionMethod::Zlib),
             2 => Ok(CompressionMethod::Lzo),
             4 => Ok(CompressionMethod::Lzx),
-            _ => Err(())
+            _ => Err(()),
         }
     }
 }
@@ -42,9 +41,8 @@ impl TryFrom<u32> for CompressionMethod {
 pub fn upk_decompress<R: Read + Seek>(
     mut reader: R,
     mode: CompressionMethod,
-    chunks: &Vec<CompressedChunk>
+    chunks: &Vec<CompressedChunk>,
 ) -> Result<Vec<Vec<u8>>> {
-
     let mut dec_data = Vec::new();
 
     for chunk in chunks {
@@ -55,12 +53,14 @@ pub fn upk_decompress<R: Read + Seek>(
         let mut _summary = reader.read_u32::<LittleEndian>()?;
         let mut summary_2 = reader.read_u32::<LittleEndian>()?;
 
-        let bswap: bool = tag != PACKAGE_TAG;
+        let bswap: bool = tag != PACKAGE_FILE_TAG;
 
         if bswap {
-            if tag.swap_bytes() != PACKAGE_TAG {
-                return Err(Error::new(ErrorKind::InvalidData, 
-                        format!("Invalid tag (0x{:04x?})", tag)));
+            if tag.swap_bytes() != PACKAGE_FILE_TAG {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid tag (0x{:04x?})", tag),
+                ));
             } else {
                 _summary = _summary.swap_bytes();
                 summary_2 = summary_2.swap_bytes();
@@ -68,7 +68,7 @@ pub fn upk_decompress<R: Read + Seek>(
             }
         }
 
-        if chunk_size == PACKAGE_TAG {
+        if chunk_size == PACKAGE_FILE_TAG {
             chunk_size = CHUNK_SIZE;
         }
 
@@ -85,22 +85,18 @@ pub fn upk_decompress<R: Read + Seek>(
             }
             raw_chunks.push((compressed_size, decompressed_size));
         }
-    
+
         let mut rchunk_data: Vec<u8> = Vec::new();
 
         for rchunk in raw_chunks {
             let mut compressed_data = vec![0u8; rchunk.0 as usize];
             reader.read_exact(&mut compressed_data)?;
 
-            let chunk_data = decompress_chunk(
-                compressed_data,
-                mode,
-                rchunk.1 as usize
-            )?;
+            let chunk_data = decompress_chunk(compressed_data, mode, rchunk.1 as usize)?;
 
             rchunk_data.extend_from_slice(&chunk_data);
         }
-        
+
         if chunk.decompressed_size as usize > rchunk_data.len() {
             rchunk_data.resize(chunk.decompressed_size as usize, 0);
         }
@@ -114,7 +110,7 @@ pub fn upk_decompress<R: Read + Seek>(
 pub fn decompress_chunk(
     compressed: Vec<u8>,
     mode: CompressionMethod,
-    expected_decompress_size: usize
+    expected_decompress_size: usize,
 ) -> Result<Vec<u8>> {
     let mut out = vec![0u8; expected_decompress_size];
     let out_len = expected_decompress_size;
@@ -122,24 +118,23 @@ pub fn decompress_chunk(
     match mode {
         CompressionMethod::Lzo => {
             lzo1x::decompress(&compressed, &mut out).unwrap();
-             
+
             if out_len > expected_decompress_size {
                 return Err(Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "LZO decompression failed. Size = {}, expected = {}", 
-                            out_len, expected_decompress_size
-                        )
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZO decompression failed. Size = {}, expected = {}",
+                        out_len, expected_decompress_size
+                    ),
                 ));
             }
 
             if out_len < expected_decompress_size {
                 out[out_len..expected_decompress_size].fill(0);
             }
-        },
-        _ => unimplemented!()
+        }
+        _ => unimplemented!(),
     }
 
     Ok(out)
 }
-
