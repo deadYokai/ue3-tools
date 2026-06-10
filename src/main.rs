@@ -16,6 +16,7 @@ mod pseudo;
 mod schema;
 mod schemadb;
 mod types;
+mod ui;
 mod upkpacker;
 mod upkprops;
 mod upkreader;
@@ -453,14 +454,15 @@ fn main() -> Result<()> {
             }
             schema_resolve(&starting_pkg, &full_path, gr, cli.verbose)?;
         }
-        Commands::Ui => open_ui()?,
+        Commands::Ui => open_ui(cli.game_root.as_deref(), cli.verbose)?,
     }
 
     Ok(())
 }
 
-fn open_ui() -> Result<()> {
-    Ok(())
+fn open_ui(game_root: Option<&str>, verbose: bool) -> Result<()> {
+    let gr = game_root.map(std::path::PathBuf::from);
+    ui::run(gr, verbose).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
 fn schema_dump(upk_path: &str, class_filter: Option<&str>) -> Result<()> {
