@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::Result,
+    io::{Read, Result, Seek},
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -9,13 +9,60 @@ use crate::{
     schemadb::{ResolvedRef, SchemaDb},
     upkprops::Property,
     upkreader::UPKPak,
+    versions::BULKDATA_STORE_IN_SEPARATE_FILE,
 };
+use byteorder::{LittleEndian, ReadBytesExt};
 
+pub mod soundnodewave;
 pub mod swfmovie;
 pub mod texture2d;
 
+pub use soundnodewave::{SoundNodeWavePayload, SoundNodeWaveSer};
 pub use swfmovie::{SwfMoviePayload, SwfMovieSer};
 pub use texture2d::{Mip, MipSource, Texture2DPayload, Texture2DSer};
+
+#[derive(Debug, Clone, Default)]
+pub struct BulkBlock {
+    pub flags: u32,
+    pub element_count: i32,
+    pub size_on_disk: i32,
+    pub offset_in_file: i32,
+    pub data: Vec<u8>,
+}
+
+impl BulkBlock {
+    pub fn read<R: Read + Seek>(r: &mut R) -> std::io::Result<Self> {
+        let flags = r.read_u32::<LittleEndian>()?;
+        let element_count = r.read_i32::<LittleEndian>()?;
+        let size_on_disk = r.read_i32::<LittleEndian>()?;
+        let offset_in_file = r.read_i32::<LittleEndian>()?;
+
+        let inline = flags & BULKDATA_STORE_IN_SEPARATE_FILE == 0;
+        let data = if inline && size_on_disk > 0 {
+            let mut buf = vec![0u8; size_on_disk as usize];
+            r.read_exact(&mut buf)?;
+            buf
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            flags,
+            element_count,
+            size_on_disk,
+            offset_in_file,
+            data,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size_on_disk == 0 && self.element_count == 0
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.flags & BULKDATA_STORE_IN_SEPARATE_FILE != 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NativePayload {
     Empty { tail: Vec<u8> },
@@ -24,6 +71,7 @@ pub enum NativePayload {
 
     Texture2D(Texture2DPayload),
     SwfMovie(SwfMoviePayload),
+    SoundNodeWave(SoundNodeWavePayload),
 }
 
 impl NativePayload {
@@ -33,6 +81,7 @@ impl NativePayload {
             NativePayload::Raw { .. } => "Raw",
             NativePayload::Texture2D(_) => "Texture2D",
             NativePayload::SwfMovie(_) => "SwfMovie",
+            NativePayload::SoundNodeWave(_) => "SoundNodeWave",
         }
     }
 }
@@ -93,6 +142,7 @@ impl NativeRegistry {
         r.register(Rc::new(Texture2DSer));
         r.register(Rc::new(SwfMovieSer));
         r.map.insert("GFxMovieInfo", Rc::new(SwfMovieSer));
+        r.register(Rc::new(SoundNodeWaveSer));
         r
     }
 

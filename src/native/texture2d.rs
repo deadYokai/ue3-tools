@@ -19,6 +19,8 @@ use crate::{
     },
 };
 
+use super::BulkBlock;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mip {
     pub flags: u32,
@@ -118,7 +120,7 @@ fn skip_byte_bulk_data<R: Read + Seek>(r: &mut R) -> Result<()> {
 impl Texture2DPayload {
     fn parse_bytes(tail: &[u8], ver: i16) -> Result<Self> {
         let mut c = Cursor::new(tail);
-        skip_byte_bulk_data(&mut c)?;
+        let _source_art = BulkBlock::read(&mut c)?;
         let mips = read_indirect_mips(&mut c)?;
 
         let tfc_guid = if ver >= VER_ADDED_TEXTURE_FILECACHE_GUIDS {

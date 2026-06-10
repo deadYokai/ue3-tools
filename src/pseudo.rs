@@ -353,17 +353,81 @@ fn render_native(out: &mut String, payload: &NativePayload, depth: usize) {
         NativePayload::Raw { bytes } => {
             let _ = writeln!(
                 out,
-                "{pad_in}bytes = @bytes({} bytes)  // class has no registered serializer",
-                bytes.len()
+                "{pad_in}bytes = @bytes({} bytes)  // class has no registered serializer\n// {:?}",
+                bytes.len(), bytes
             );
         }
         NativePayload::Texture2D(p) => render_texture2d(out, p, depth + 1),
         NativePayload::SwfMovie(p) => {
             let _ = writeln!(out, "{pad_in}raw_data_bytes = {}", p.raw_data.len());
         }
+        NativePayload::SoundNodeWave(p) => render_sound(out, p, depth + 1),
     }
 
     let _ = writeln!(out, "{pad}}}");
+}
+
+fn render_sound(out: &mut String, p: &crate::native::SoundNodeWavePayload, depth: usize) {
+    let pad = INDENT.repeat(depth);
+
+    let _ = writeln!(
+        out,
+        "{pad}info = {{ channels = {}, sample_rate = {}, duration = {:.3}s }}",
+        p.num_channels
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+        p.sample_rate
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+        p.duration.unwrap_or(0.0),
+    );
+
+    let blocks = [
+        ("raw_data", &p.raw_data),
+        ("compressed_pc", &p.compressed_pc),
+        ("compressed_xbox360", &p.compressed_xbox360),
+        ("compressed_ps3", &p.compressed_ps3),
+    ];
+
+    for (name, b) in blocks {
+        if b.is_empty() {
+            let _ = writeln!(out, "{pad}{name} = empty");
+        } else {
+            let sniff = crate::native::soundnodewave::AudioSniff::of(&b.data);
+            let where_ = if b.is_external() {
+                format!("tfc-like(offset={})", b.offset_in_file)
+            } else {
+                "inline".to_string()
+            };
+            let _ = writeln!(
+                out,
+                "{pad}{name} = {{ flags = 0x{:08x}, elements = {}, bytes = {}, source = {where_}, sniff = {} }}",
+                b.flags,
+                b.element_count,
+                b.size_on_disk,
+                sniff.label(),
+            );
+        }
+    }
+
+    if !p.channel_offsets.is_empty() || !p.channel_sizes.is_empty() {
+        let _ = writeln!(out, "{pad}channels = [");
+        let n = p.channel_offsets.len().max(p.channel_sizes.len());
+        for i in 0..n {
+            let off = p.channel_offsets.get(i).copied().unwrap_or(0);
+            let sz = p.channel_sizes.get(i).copied().unwrap_or(0);
+            let _ = writeln!(out, "{pad}    {{ offset = {off}, size = {sz} }}");
+        }
+        let _ = writeln!(out, "{pad}]");
+    }
+
+    if !p.trailing_raw.is_empty() {
+        let _ = writeln!(
+            out,
+            "{pad}trailing = @bytes({} bytes)",
+            p.trailing_raw.len()
+        );
+    }
 }
 
 fn render_texture2d(out: &mut String, p: &crate::native::Texture2DPayload, depth: usize) {

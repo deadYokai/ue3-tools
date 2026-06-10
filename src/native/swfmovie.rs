@@ -12,6 +12,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct SwfMoviePayload {
     pub raw_data: Vec<u8>,
+    pub recovered_via_schema: bool,
 }
 
 pub struct SwfMovieSer;
@@ -22,32 +23,37 @@ impl NativeSerializer for SwfMovieSer {
     }
 
     fn read(&self, ctx: &NativeReadCtx) -> Result<NativeRead> {
-        let bytes: Vec<u8> = ctx
+        let (raw_data, via_schema) = ctx
             .props
             .iter()
             .find(|p| p.name == "RawData")
-            .and_then(|p| match &p.value {
-                PropertyValue::Array(arr) => Some(
-                    arr.iter()
+            .map(|p| match &p.value {
+                PropertyValue::Array(arr) => {
+                    let bytes: Vec<u8> = arr
+                        .iter()
                         .filter_map(|el| match el {
                             PropertyValue::Byte(b) => Some(*b),
                             _ => None,
                         })
-                        .collect(),
-                ),
-                _ => None,
+                        .collect();
+                    (bytes, true)
+                }
+                PropertyValue::Raw(buf) => (buf.clone(), false),
+                _ => (Vec::new(), false),
             })
-            .unwrap_or_default();
+            .unwrap_or((Vec::new(), false));
 
-        let payload = NativePayload::SwfMovie(SwfMoviePayload { raw_data: bytes });
-        let consumed = if !ctx.blob.is_empty()
-            || matches!(
-                &payload, NativePayload::SwfMovie(p) if !p.raw_data.is_empty()
-            ) {
-            vec!["RawData".to_string()]
-        } else {
-            Vec::new()
+        let payload = SwfMoviePayload {
+            raw_data,
+            recovered_via_schema: via_schema,
         };
+
+        let consumed = if payload.raw_data.is_empty() {
+            Vec::new()
+        } else {
+            vec!["RawData".to_string()]
+        };
+        let payload = NativePayload::SwfMovie(payload);
         Ok(NativeRead {
             payload,
             consumed_props: consumed,
@@ -65,8 +71,26 @@ impl NativeSerializer for SwfMovieSer {
             _ => return Ok(Vec::new()),
         };
         if p.raw_data.is_empty() {
+            eprintln!(
+                "  \x1b[33mgfx\x1b[0m: {stem} has no RawData payload — \
+                 check that the SwfMovie/GFxMovieInfo export actually carries Flash bytes"
+            );
             return Ok(Vec::new());
         }
+
+        let head = &p.raw_data[..p.raw_data.len().min(4)];
+        if !(head.starts_with(b"GFX")
+            || head.starts_with(b"CWS")
+            || head.starts_with(b"FWS")
+            || head.starts_with(b"ZWS"))
+        {
+            eprintln!(
+                "  \x1b[33mgfx\x1b[0m: {stem} RawData magic 0x{:02x?} does not look like Flash; \
+                 writing anyway",
+                head
+            );
+        }
+
         let gfx_path = dir.join(format!("{stem}.gfx"));
         File::create(&gfx_path)?.write_all(&p.raw_data)?;
         println!(

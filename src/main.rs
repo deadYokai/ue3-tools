@@ -319,6 +319,9 @@ enum Commands {
         starting_pkg: String,
         full_path: String,
     },
+
+    #[command(about = "open UI")]
+    Ui,
 }
 
 fn schema_resolve(starting: &str, full_path: &str, game_root: &str, verbose: bool) -> Result<()> {
@@ -450,8 +453,13 @@ fn main() -> Result<()> {
             }
             schema_resolve(&starting_pkg, &full_path, gr, cli.verbose)?;
         }
+        Commands::Ui => open_ui()?,
     }
 
+    Ok(())
+}
+
+fn open_ui() -> Result<()> {
     Ok(())
 }
 
@@ -464,7 +472,7 @@ fn schema_dump(upk_path: &str, class_filter: Option<&str>) -> Result<()> {
 
     let ctx = SchemaParseCtx {
         p_ver: header.p_ver,
-        cooked_for_console: true,
+        cooked_for_console: false,
     };
 
     println!("Parsing schema (p_ver={})", ctx.p_ver);
@@ -553,6 +561,9 @@ fn summarize_entry(e: &crate::schema::SchemaEntry) -> String {
                 c.array_dim,
                 c.property_flags
             )
+        }
+        OpaqueChild { class_name, next } => {
+            format!("OpaqueChild({class_name}) next={next}")
         }
     }
 }

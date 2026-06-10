@@ -10,9 +10,11 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::{
-    schema::{PropertyKind, SchemaEntry, SchemaParseCtx, parse_export_schema},
-    utils::decompress::{CompressionMethod, upk_decompress},
+    schema::{
+        PropertyKind, SchemaEntry, SchemaParseCtx, parse_export_schema, parse_opaque_field_next,
+    },
     upkreader::{FName, PackageFlags, UPKPak, UpkHeader},
+    utils::decompress::{CompressionMethod, upk_decompress},
     versions::VER_BYTEPROP_SERIALIZE_ENUM,
 };
 
@@ -330,20 +332,49 @@ impl SchemaDb {
         let blob = pkg.export_blob(r.export_idx)?.to_vec();
         let class_name = pkg.export_class_name(r.export_idx);
         let ctx = pkg.schema_ctx();
-        let parsed = parse_export_schema(&blob, &class_name, &pkg.pak, ctx);
+        {
+            let n = blob.len().min(48);
+            let hex: String = blob[..n]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "schemadb: blob {}::#{} class='{}' p_ver={} ofs={} size={} flags=0x{:08x}",
+                r.stem_lc,
+                r.export_idx,
+                class_name,
+                ctx.p_ver,
+                pkg.pak.export_table[(r.export_idx - 1) as usize].serial_offset,
+                pkg.pak.export_table[(r.export_idx - 1) as usize].serial_size,
+                pkg.pak.export_table[(r.export_idx - 1) as usize].object_flags,
+            );
+            eprintln!("schemadb: first {} bytes: {}", n, hex);
+        }
+        let parsed = parse_export_schema(&blob, &class_name, &pkg.pak, ctx)
+    .map_err(|e| Error::new(
+        e.kind(),
+        format!(
+            "parse_export_schema failed for {}::#{} (class='{}', blob_len={}, p_ver={}, cooked={}): {}",
+            r.stem_lc, r.export_idx, class_name, blob.len(),
+            ctx.p_ver, ctx.cooked_for_console, e
+        ),
+    ));
 
         self.visiting.borrow_mut().remove(&key);
 
         let entry = match parsed {
             Ok(Some(e)) => Rc::new(e),
             Ok(None) => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "{}::#{} has class '{}' not handled by schema parser",
-                        r.stem_lc, r.export_idx, class_name
-                    ),
+                let next = parse_opaque_field_next(&blob, &pkg.pak, ctx.p_ver, &class_name);
+                self.note_miss(format!(
+                    "opaque child {}::#{}: class '{}' (next={next}, walk continues)",
+                    r.stem_lc, r.export_idx, class_name
                 ));
+                Rc::new(SchemaEntry::OpaqueChild {
+                    class_name: class_name.clone(),
+                    next,
+                })
             }
             Err(e) => return Err(e),
         };

@@ -1,4 +1,4 @@
-use std::io::{Cursor, Error, ErrorKind, Result, Seek, SeekFrom};
+use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 use crate::upkprops::parse_property;
 use crate::upkreader::{FName, UPKPak, read_fstring_stream};
 use crate::versions::*;
+
+fn tag<T>(c: &Cursor<&Vec<u8>>, what: &str, r: Result<T>) -> Result<T> {
+    r.map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!(
+                "{what} @ pos={} (blob_len={}): {e}",
+                c.position(),
+                c.get_ref().len()
+            ),
+        )
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SchemaParseCtx {
@@ -167,9 +180,10 @@ pub struct ClassExtra {
     pub auto_expand_categories: Option<Vec<FName>>,
     pub auto_collapse_categories: Option<Vec<FName>>,
     pub b_force_script_order: Option<u32>,
-    pub class_group_names: Option<Vec<FName>>,
+    pub class_group_names: Option<FName>,
     pub dll_bind_name: Option<FName>,
     pub class_default_object: i32,
+    class_header_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +225,10 @@ pub enum SchemaEntry {
         value: String,
     },
     Property(PropertyKind),
+    OpaqueChild {
+        class_name: String,
+        next: i32,
+    },
 }
 
 impl SchemaEntry {
@@ -221,6 +239,7 @@ impl SchemaEntry {
             | SchemaEntry::State { header, .. }
             | SchemaEntry::Class { header, .. }
             | SchemaEntry::ScriptStruct { header, .. } => Some(header),
+            SchemaEntry::OpaqueChild { .. } => None,
             _ => None,
         }
     }
@@ -230,6 +249,7 @@ impl SchemaEntry {
             SchemaEntry::Property(p) => p.common().next,
             SchemaEntry::Enum { next, .. } => *next,
             SchemaEntry::Const { next, .. } => *next,
+            SchemaEntry::OpaqueChild { next, .. } => *next,
             SchemaEntry::Struct { header }
             | SchemaEntry::Function { header, .. }
             | SchemaEntry::State { header, .. }
@@ -237,6 +257,22 @@ impl SchemaEntry {
             | SchemaEntry::ScriptStruct { header, .. } => header.next,
         }
     }
+}
+
+pub fn parse_opaque_field_next(blob: &[u8], pak: &UPKPak, p_ver: i16, class_name: &str) -> i32 {
+    let v = blob.to_vec();
+    let mut c = Cursor::new(&v);
+
+    if skip_object_prefix(&mut c, pak, p_ver, class_name).is_err() {
+        return 0;
+    }
+
+    if p_ver < VER_MOVED_SUPERFIELD_TO_USTRUCT {
+        if c.read_i32::<LittleEndian>().is_err() {
+            return 0;
+        }
+    }
+    c.read_i32::<LittleEndian>().unwrap_or(0)
 }
 
 pub fn parse_export_schema(
@@ -248,7 +284,12 @@ pub fn parse_export_schema(
     let v = blob.to_vec();
     let mut c = Cursor::new(&v);
 
-    skip_object_prefix(&mut c, pak, ctx.p_ver)?;
+    skip_object_prefix(&mut c, pak, ctx.p_ver, class_name).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!("skip_object_prefix @ pos={}: {e}", c.position()),
+        )
+    })?;
 
     match class_name {
         "Struct" => Ok(Some(SchemaEntry::Struct {
@@ -257,11 +298,29 @@ pub fn parse_export_schema(
 
         "ScriptStruct" => Ok(Some(parse_script_struct(&mut c, pak, ctx)?)),
 
-        "Function" => Ok(Some(parse_function(&mut c, pak, ctx)?)),
+        "Function" => Ok(Some(tag(
+            &c.clone(),
+            "parse_function",
+            parse_function(&mut c, pak, ctx),
+        )?)),
 
         "State" => Ok(Some(parse_state(&mut c, pak, ctx)?)),
 
-        "Class" => Ok(Some(parse_class(&mut c, pak, ctx)?)),
+        "Class" => {
+            let start = c.position();
+            let res = parse_class(&mut c, pak, ctx);
+            match res {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => Err(Error::new(
+                    e.kind(),
+                    format!(
+                        "parse_class start={start} end={} (blob_len={}): {e}",
+                        c.position(),
+                        c.get_ref().len()
+                    ),
+                )),
+            }
+        }
 
         "Enum" => Ok(Some(parse_enum(&mut c, pak, ctx)?)),
 
@@ -314,9 +373,43 @@ pub fn parse_export_schema(
     }
 }
 
-fn skip_object_prefix(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, p_ver: i16) -> Result<()> {
+fn skip_object_prefix(
+    c: &mut Cursor<&Vec<u8>>,
+    pak: &UPKPak,
+    p_ver: i16,
+    class_name: &str,
+) -> Result<()> {
     if p_ver >= VER_NETINDEX_STORED_AS_INT {
         let _net_index = c.read_i32::<LittleEndian>()?;
+    }
+
+    let is_meta = matches!(
+        class_name,
+        "Class"
+            | "Struct"
+            | "ScriptStruct"
+            | "State"
+            | "Function"
+            | "Enum"
+            | "Const"
+            | "Field"
+            | "ByteProperty"
+            | "IntProperty"
+            | "BoolProperty"
+            | "FloatProperty"
+            | "ObjectProperty"
+            | "ComponentProperty"
+            | "InterfaceProperty"
+            | "ClassProperty"
+            | "NameProperty"
+            | "StrProperty"
+            | "ArrayProperty"
+            | "StructProperty"
+            | "MapProperty"
+            | "DelegateProperty"
+    );
+    if is_meta {
+        return Ok(());
     }
 
     loop {
@@ -477,6 +570,7 @@ fn parse_class(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> R
         auto_collapse_categories,
         b_force_script_order,
         class_group_names,
+        class_header_filename,
     ) = if !ctx.cooked_for_console {
         let dont_sort = if ctx.p_ver >= VER_DONTSORTCATEGORIES_ADDED {
             Some(read_fname_array(c)?)
@@ -491,8 +585,18 @@ fn parse_class(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> R
         } else {
             None
         };
+        let mut remaining = Vec::new();
+        c.read_to_end(&mut remaining)?;
+
+        c.set_position(c.position() - remaining.len() as u64);
+
         let groups = if ctx.p_ver >= VER_ADDED_CLASS_GROUPS {
-            Some(read_fname_array(c)?)
+            Some(read_fname(c)?)
+        } else {
+            None
+        };
+        let class_header_filename = if ctx.p_ver >= VER_ADDED_CLASS_HEADER_FILENAME {
+            Some(read_fstring_stream(c)?)
         } else {
             None
         };
@@ -503,9 +607,10 @@ fn parse_class(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> R
             Some(auto_col),
             force_order,
             groups,
+            class_header_filename,
         )
     } else {
-        (None, None, None, None, None, None)
+        (None, None, None, None, None, None, None)
     };
 
     let dll_bind_name = if ctx.p_ver >= VER_SCRIPT_BIND_DLL_FUNCTIONS {
@@ -533,6 +638,7 @@ fn parse_class(c: &mut Cursor<&Vec<u8>>, pak: &UPKPak, ctx: SchemaParseCtx) -> R
             class_group_names,
             dll_bind_name,
             class_default_object,
+            class_header_filename,
         },
     })
 }
