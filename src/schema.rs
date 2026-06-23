@@ -436,9 +436,7 @@ fn parse_field_prefix(c: &mut Cursor<&Vec<u8>>, p_ver: i16) -> Result<(i32, Opti
     } else {
         None
     };
-    println!("pre_756_super: {:?}\n", pre_756_super);
     let next = c.read_i32::<LittleEndian>()?;
-    println!("next: {:?}\n", next);
     Ok((next, pre_756_super))
 }
 
@@ -454,46 +452,32 @@ fn parse_struct_header(
     } else {
         pre_756_super.unwrap_or(0)
     };
-    println!("super_struct: {:?}\n", super_struct);
 
     let script_text = if !ctx.cooked_for_console {
         Some(c.read_i32::<LittleEndian>()?)
     } else {
         None
     };
-    println!("script_text: {:?}\n", script_text);
 
     let children = c.read_i32::<LittleEndian>()?;
-    println!("children: {:?}\n", children);
 
     let (cpp_text, editor_line_pos) = if !ctx.cooked_for_console {
         let cpp = c.read_i32::<LittleEndian>()?;
-        println!("cpp: {:?}\n", cpp);
         let line = c.read_i32::<LittleEndian>()?;
-        println!("line: {:?}\n", line);
         let text_pos = c.read_i32::<LittleEndian>()?;
-        println!("text_pos: {:?}\n", text_pos);
         (Some(cpp), Some((line, text_pos)))
     } else {
         (None, None)
     };
 
     let bytecode_size = c.read_i32::<LittleEndian>()?;
-    println!("bytecode_size: {:?}\n", bytecode_size);
     let on_disk_script_size = if ctx.p_ver >= VER_USTRUCT_SERIALIZE_ONDISK_SCRIPTSIZE {
         c.read_i32::<LittleEndian>()?
     } else {
         bytecode_size
     };
-    println!("on_disk_script_size: {:?}\n", on_disk_script_size);
-
     let mut remaining = Vec::new();
     c.read_to_end(&mut remaining)?;
-    eprintln!(
-        "remaining {} bytes: {:02x?}",
-        remaining.len(),
-        &remaining[..remaining.len()]
-    );
     c.set_position(c.position() - remaining.len() as u64);
 
     let script_offset_in_blob = c.position();
@@ -532,25 +516,19 @@ fn parse_function(
     ctx: SchemaParseCtx,
 ) -> Result<SchemaEntry> {
     let header = parse_struct_header(c, pak, ctx)?;
-    println!("header: {:?}\n", header);
     let i_native = c.read_u16::<LittleEndian>()?;
-    println!("i_native: {:?}\n", i_native);
     let oper_precedence = c.read_u8()?;
-    println!("oper_precedence: {:?}\n", oper_precedence);
     let function_flags = c.read_u32::<LittleEndian>()?;
-    println!("function_flags: {:?}\n", function_flags);
     let rep_offset = if function_flags & FUNC_NET != 0 {
         Some(c.read_u16::<LittleEndian>()?)
     } else {
         None
     };
-    println!("rep_offset: {:?}\n", rep_offset);
     let friendly_name = if !ctx.cooked_for_console {
         Some(read_fname(c)?)
     } else {
         None
     };
-    println!("friendly_name: {:?}\n", friendly_name);
     Ok(SchemaEntry::Function {
         header,
         extra: FunctionExtra {

@@ -905,7 +905,7 @@ pub fn write_extracted_file(
             if tail.is_empty() {
                 NativeRead::just(NativePayload::Empty { tail: Vec::new() })
             } else if let (Some(db), Some(cref)) = (db, owner_class_ref.as_ref()) {
-                match crate::upkprops::read_native_props(tail, pkg, p_ver, db, cref) {
+                match crate::upkprops::read_native_props(tail, pkg, p_ver, db, cref, &props) {
                     Some(fields) => NativeRead::just(NativePayload::NativeProps { fields }),
                     None => NativeRead::just(NativePayload::Raw {
                         bytes: tail.to_vec(),

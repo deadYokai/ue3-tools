@@ -339,17 +339,17 @@ impl SchemaDb {
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
-            eprintln!(
-                "schemadb: blob {}::#{} class='{}' p_ver={} ofs={} size={} flags=0x{:08x}",
-                r.stem_lc,
-                r.export_idx,
-                class_name,
-                ctx.p_ver,
-                pkg.pak.export_table[(r.export_idx - 1) as usize].serial_offset,
-                pkg.pak.export_table[(r.export_idx - 1) as usize].serial_size,
-                pkg.pak.export_table[(r.export_idx - 1) as usize].object_flags,
-            );
-            eprintln!("schemadb: first {} bytes: {}", n, hex);
+            // eprintln!(
+            //     "schemadb: blob {}::#{} class='{}' p_ver={} ofs={} size={} flags=0x{:08x}",
+            //     r.stem_lc,
+            //     r.export_idx,
+            //     class_name,
+            //     ctx.p_ver,
+            //     pkg.pak.export_table[(r.export_idx - 1) as usize].serial_offset,
+            //     pkg.pak.export_table[(r.export_idx - 1) as usize].serial_size,
+            //     pkg.pak.export_table[(r.export_idx - 1) as usize].object_flags,
+            // );
+            // eprintln!("schemadb: first {} bytes: {}", n, hex);
         }
         let parsed = parse_export_schema(&blob, &class_name, &pkg.pak, ctx)
     .map_err(|e| Error::new(

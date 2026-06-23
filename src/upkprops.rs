@@ -752,11 +752,11 @@ fn read_struct_binary(
                 _ => continue,
             };
             if dim == 1 {
-                fields.push((name, read_one_by_inner(r, &field_ctx, &cref, &centry)?));
+                fields.push((name, read_value_positional(r, &field_ctx, &cref, &centry)?));
             } else {
                 let mut arr = Vec::with_capacity(dim as usize);
                 for _ in 0..dim {
-                    arr.push(read_one_by_inner(r, &field_ctx, &cref, &centry)?);
+                    arr.push(read_value_positional(r, &field_ctx, &cref, &centry)?);
                 }
                 fields.push((name, PropertyValue::Array(arr)));
             }
@@ -775,56 +775,162 @@ pub fn read_native_props(
     ver: i16,
     db: &SchemaDb,
     class_ref: &ResolvedRef,
+    tagged: &[Property],
 ) -> Option<Vec<Property>> {
     if tail.is_empty() {
         return None;
     }
-    let chain = db.class_chain(class_ref).ok()?; // [self, super, ..., root]
-    let collect = |classes: &[ResolvedRef]| -> Vec<NativeField> {
-        let mut v = Vec::new();
-        for k in classes {
-            for (name, pref, pentry) in db.list_children(k).unwrap_or_default() {
-                let native = matches!(&*pentry, SchemaEntry::Property(pk)
-                    if pk.common().property_flags & CPF_NATIVE != 0);
-                if native {
-                    v.push((k.clone(), name, pref, pentry));
-                }
+    let blob = tail.to_vec();
+    let mut r = Cursor::new(&blob);
+    let mut out: Vec<Property> = Vec::new();
+
+    let chain = db.class_chain(class_ref).ok()?;
+    let mut ok = true;
+    'outer: for klass in &chain {
+        let kctx = PropertyCtx {
+            pak: ctx_pak,
+            ver,
+            db: Some(db),
+            owner: Some(klass.clone()),
+        };
+        for (name, pref, pentry) in db.list_children(klass).unwrap_or_default() {
+            let tv = tagged.iter().find(|p| p.name == name).map(|p| &p.value);
+            if emit_native(&mut r, &kctx, &name, &pref, &pentry, tv, &mut out).is_err() {
+                ok = false;
+                break 'outer;
             }
         }
-        v
+    }
+
+    Some(out)
+
+    // if ok && r.position() as usize <= blob.len() && !out.is_empty() {
+    //     Some(out)
+    // } else {
+    //     if !out.is_empty() {
+    //         eprintln!(
+    //             "  \x1b[33mnative\x1b[0m '{}': recursive CPF_Native walk consumed {} of {} \
+    //              tail bytes ({} field(s)); emitting Raw",
+    //             db.export_object_name(class_ref).unwrap_or_default(),
+    //             r.position(),
+    //             blob.len(),
+    //             out.len()
+    //         );
+    //     }
+    //     None
+    // }
+}
+
+fn emit_native(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    name: &str,
+    pref: &ResolvedRef,
+    pentry: &SchemaEntry,
+    tagged_val: Option<&PropertyValue>,
+    out: &mut Vec<Property>,
+) -> Result<()> {
+    let kind = match pentry {
+        SchemaEntry::Property(k) => k,
+        _ => return Ok(()),
     };
+    let common = kind.common();
 
-    let mut base_first: Vec<ResolvedRef> = chain.clone();
-    base_first.reverse();
+    if common.property_flags & CPF_NATIVE != 0 {
+        let dim = common.array_dim.max(1);
+        let value = if dim > 1 {
+            let mut arr = Vec::new();
+            for _ in 0..dim {
+                arr.push(read_value_positional(r, ctx, pref, pentry)?);
+            }
+            PropertyValue::Array(arr)
+        } else {
+            read_value_positional(r, ctx, pref, pentry)?
+        };
+        out.push(Property {
+            name: name.to_string(),
+            prop_type: String::new(),
+            size: 0,
+            array_index: 0,
+            value,
+            enum_name: None,
+            struct_name: None,
+        });
+        return Ok(());
+    }
 
-    let candidates = [collect(&chain), collect(&base_first), collect(&chain[..1])];
-
-    let mut best: (usize, u64) = (0, 0);
-    for list in &candidates {
-        if list.is_empty() {
-            continue;
+    match kind {
+        PropertyKind::Struct { struct_obj, .. } => {
+            let sctx = ctx.with_owner(pref.clone());
+            let (sref, _) = resolve_struct_obj(&sctx, *struct_obj)?;
+            emit_native_struct(r, ctx, &sref, name, tagged_val, out)?;
         }
-        match try_read_native_list(tail, ctx_pak, ver, db, list) {
-            Ok(fields) => return Some(fields),
-            Err(miss) => {
-                if miss.1 > best.1 {
-                    best = miss;
+        PropertyKind::Array { inner, .. } => {
+            let db = ctx
+                .db
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no SchemaDb"))?;
+            let pkg = db.open_package(&pref.stem_lc)?;
+            let inner_ref = match db.resolve_index(&pkg, *inner)? {
+                Some(x) => x,
+                None => return Ok(()),
+            };
+            let inner_entry = db.entry(&inner_ref)?;
+            if let SchemaEntry::Property(PropertyKind::Struct { struct_obj, .. }) = &*inner_entry {
+                let count = match tagged_val {
+                    Some(PropertyValue::Array(elems)) => elems.len(),
+                    _ => 0,
+                };
+                if count > 0 {
+                    let ictx = ctx.with_owner(inner_ref.clone());
+                    let (sref, _) = resolve_struct_obj(&ictx, *struct_obj)?;
+                    for i in 0..count {
+                        let elem_tv = match tagged_val {
+                            Some(PropertyValue::Array(elems)) => Some(&elems[i]),
+                            _ => None,
+                        };
+                        emit_native_struct(r, ctx, &sref, &format!("{name}[{i}]"), elem_tv, out)?;
+                    }
                 }
             }
         }
+        _ => {}
     }
+    Ok(())
+}
 
-    if best.0 > 0 {
-        eprintln!(
-            "  \x1b[33mnative\x1b[0m '{}': no CPF_Native ordering consumed the tail \
-             exactly (best {} field(s), {} of {} bytes); emitting Raw",
-            db.export_object_name(class_ref).unwrap_or_default(),
-            best.0,
-            best.1,
-            tail.len()
-        );
+fn emit_native_struct(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    sref: &ResolvedRef,
+    prefix: &str,
+    tagged_val: Option<&PropertyValue>,
+    out: &mut Vec<Property>,
+) -> Result<()> {
+    let db = ctx
+        .db
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no SchemaDb"))?;
+    let sctx = ctx.with_owner(sref.clone());
+    for (mname, mref, mentry) in db.list_children(sref).unwrap_or_default() {
+        let m_tv = match tagged_val {
+            Some(PropertyValue::Struct(fields)) => {
+                fields.iter().find(|p| p.name == mname).map(|p| &p.value)
+            }
+            Some(PropertyValue::AtomicStruct(fields)) => {
+                fields.iter().find(|(n, _)| *n == mname).map(|(_, v)| v)
+            }
+            _ => None,
+        };
+        emit_native(
+            r,
+            &sctx,
+            &format!("{prefix}.{mname}"),
+            &mref,
+            &mentry,
+            m_tv,
+            out,
+        )?;
     }
-    None
+    Ok(())
 }
 
 fn try_read_native_list(
