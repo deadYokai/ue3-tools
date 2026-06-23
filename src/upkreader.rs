@@ -685,6 +685,107 @@ pub fn list_full_obj_paths(pkg: &UPKPak) -> Vec<String> {
         .collect()
 }
 
+fn read_tagged_at(
+    db: &SchemaDb,
+    owner_ref: &ResolvedRef,
+    pkg: &UPKPak,
+    p_ver: i16,
+    target_idx: i32,
+    offset: Option<u64>,
+) -> Vec<crate::upkprops::Property> {
+    db.open_package(&owner_ref.stem_lc)
+        .ok()
+        .and_then(|lp| lp.export_blob(target_idx).ok().map(|b| b.to_vec()))
+        .and_then(|v| {
+            let mut c = Cursor::new(&v);
+            match offset {
+                Some(off) => c.set_position(off),
+                None => {
+                    if p_ver >= VER_NETINDEX_STORED_AS_INT {
+                        let _ = c.read_i32::<LittleEndian>();
+                    }
+                }
+            }
+            get_obj_props_with_db(&mut c, pkg, false, p_ver, Some(db), Some(owner_ref.clone()))
+                .ok()
+                .map(|(props, _)| props)
+        })
+        .unwrap_or_default()
+}
+
+fn render_meta_export(
+    db: &SchemaDb,
+    self_ref: &ResolvedRef,
+    pkg: &UPKPak,
+    pkg_stem: &str,
+    p_ver: i16,
+    export_index: i32,
+    export_full_path: &str,
+) -> Option<String> {
+    use crate::schema::SchemaEntry;
+    let entry = db.entry(self_ref).ok()?;
+    match &*entry {
+        SchemaEntry::ScriptStruct { extra, .. } => {
+            let defaults = read_tagged_at(
+                db,
+                self_ref,
+                pkg,
+                p_ver,
+                self_ref.export_idx,
+                Some(extra.default_props_offset_in_blob),
+            );
+            crate::pseudo::render_struct_def(
+                db,
+                self_ref,
+                pkg,
+                pkg_stem,
+                p_ver,
+                export_index,
+                export_full_path,
+                &defaults,
+            )
+        }
+        SchemaEntry::Struct { .. } => crate::pseudo::render_struct_def(
+            db,
+            self_ref,
+            pkg,
+            pkg_stem,
+            p_ver,
+            export_index,
+            export_full_path,
+            &[],
+        ),
+        SchemaEntry::Enum { .. } => crate::pseudo::render_enum_def(
+            db,
+            self_ref,
+            pkg,
+            pkg_stem,
+            p_ver,
+            export_index,
+            export_full_path,
+        ),
+        SchemaEntry::Const { .. } => crate::pseudo::render_const_def(
+            db,
+            self_ref,
+            pkg,
+            pkg_stem,
+            p_ver,
+            export_index,
+            export_full_path,
+        ),
+        SchemaEntry::Property(_) => crate::pseudo::render_property_def(
+            db,
+            self_ref,
+            pkg,
+            pkg_stem,
+            p_ver,
+            export_index,
+            export_full_path,
+        ),
+        _ => None,
+    }
+}
+
 pub fn write_extracted_file(
     path: &Path,
     buf: &[u8],
@@ -702,6 +803,77 @@ pub fn write_extracted_file(
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
     let dir = path.parent().unwrap();
     std::fs::create_dir_all(dir)?;
+
+    if ext == "Class" {
+        if let (Some(db), Some(self_ref)) = (db, self_ref.as_ref()) {
+            let cdo_props = match db.entry(self_ref) {
+                Ok(e) => match &*e {
+                    crate::schema::SchemaEntry::Class { extra, .. }
+                        if extra.class_default_object > 0 =>
+                    {
+                        let cdo_idx = extra.class_default_object;
+                        db.open_package(&self_ref.stem_lc)
+                            .ok()
+                            .and_then(|lp| lp.export_blob(cdo_idx).ok().map(|b| b.to_vec()))
+                            .and_then(|v| {
+                                let mut c = Cursor::new(&v);
+                                if p_ver >= VER_NETINDEX_STORED_AS_INT {
+                                    let _ = c.read_i32::<LittleEndian>();
+                                }
+                                get_obj_props_with_db(
+                                    &mut c,
+                                    pkg,
+                                    false,
+                                    p_ver,
+                                    Some(db),
+                                    Some(self_ref.clone()),
+                                )
+                                .ok()
+                                .map(|(props, _)| props)
+                            })
+                            .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            };
+
+            if let Some(text) = crate::pseudo::render_class_def(
+                db,
+                self_ref,
+                pkg,
+                pkg_stem,
+                p_ver,
+                export_index,
+                export_full_path,
+                &cdo_props,
+            ) {
+                let uo_path = dir.join(format!("{name}.uo"));
+                std::fs::write(&uo_path, text.as_bytes())?;
+                return Ok(uo_path);
+            }
+        }
+    }
+
+    let is_meta_def =
+        matches!(ext, "ScriptStruct" | "Struct" | "Enum" | "Const") || ext.ends_with("Property");
+    if is_meta_def {
+        if let (Some(db), Some(self_ref)) = (db, self_ref.as_ref()) {
+            if let Some(text) = render_meta_export(
+                db,
+                self_ref,
+                pkg,
+                pkg_stem,
+                p_ver,
+                export_index,
+                export_full_path,
+            ) {
+                let uo_path = dir.join(format!("{name}.uo"));
+                std::fs::write(&uo_path, text.as_bytes())?;
+                return Ok(uo_path);
+            }
+        }
+    }
 
     let buf_vec = buf.to_vec();
     let mut cursor = Cursor::new(&buf_vec);
@@ -729,13 +901,22 @@ pub fn write_extracted_file(
             self_ref: self_ref.clone(),
             class_ref: owner_class_ref.clone(),
         })?,
-        None => NativeRead::just(if tail.is_empty() {
-            NativePayload::Empty { tail: Vec::new() }
-        } else {
-            NativePayload::Raw {
-                bytes: tail.to_vec(),
+        None => {
+            if tail.is_empty() {
+                NativeRead::just(NativePayload::Empty { tail: Vec::new() })
+            } else if let (Some(db), Some(cref)) = (db, owner_class_ref.as_ref()) {
+                match crate::upkprops::read_native_props(tail, pkg, p_ver, db, cref) {
+                    Some(fields) => NativeRead::just(NativePayload::NativeProps { fields }),
+                    None => NativeRead::just(NativePayload::Raw {
+                        bytes: tail.to_vec(),
+                    }),
+                }
+            } else {
+                NativeRead::just(NativePayload::Raw {
+                    bytes: tail.to_vec(),
+                })
             }
-        }),
+        }
     };
 
     let sidecars = match &ser {
@@ -876,6 +1057,22 @@ pub fn read_string(cursor: &mut Cursor<&Vec<u8>>) -> Result<String> {
     let len = cursor.read_i32::<LittleEndian>()?;
     if len == 0 {
         return Ok("".to_string());
+    }
+
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize) as u64;
+    let needed: u64 = if len > 0 {
+        len as u64
+    } else {
+        (len as i64).unsigned_abs().saturating_mul(2)
+    };
+    if needed > remaining {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("FString length {len} exceeds {remaining} remaining bytes"),
+        ));
     }
 
     if len > 0 {

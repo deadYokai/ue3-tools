@@ -110,6 +110,18 @@ fn read_fname(r: &mut Cursor<&Vec<u8>>) -> Result<FName> {
     })
 }
 
+fn read_count(r: &mut Cursor<&Vec<u8>>) -> Result<i32> {
+    let count = r.read_i32::<LittleEndian>()?;
+    let remaining = (r.get_ref().len() as u64).saturating_sub(r.position());
+    if count < 0 || count as u64 > remaining {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("array count {count} implausible vs {remaining} remaining bytes"),
+        ));
+    }
+    Ok(count)
+}
+
 fn write_fname<W: Write>(w: &mut W, f: &FName) -> Result<()> {
     w.write_i32::<LittleEndian>(f.name_index)?;
     w.write_i32::<LittleEndian>(f.name_instance)?;
@@ -437,28 +449,85 @@ fn parse_array_ctx(
     size: i32,
     prop_name: &str,
 ) -> Result<PropertyValue> {
-    let count = r.read_i32::<LittleEndian>()?;
+    let value_start = r.position();
+    let blob_len = {
+        let e = r.seek(SeekFrom::End(0))?;
+        r.seek(SeekFrom::Start(value_start))?;
+        e
+    };
+    let end = value_start.saturating_add(size.max(0) as u64).min(blob_len);
+
+    let count = read_count(r)?;
     if count <= 0 {
-        let consumed = 4i64;
-        let remain = size as i64 - consumed;
-        if remain > 0 {
-            r.seek(SeekFrom::Current(remain))?;
+        if r.position() < end {
+            r.seek(SeekFrom::Start(end))?;
         }
         return Ok(PropertyValue::Array(Vec::new()));
     }
 
     if let (Some(db), Some(owner)) = (ctx.db, &ctx.owner) {
         if let Ok(Some((inner_ref, inner_entry))) = db.array_inner_for(owner, prop_name) {
-            let mut elems = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                elems.push(read_one_by_inner(r, ctx, &inner_ref, &inner_entry)?);
+            if let SchemaEntry::Property(PropertyKind::Struct { struct_obj, .. }) = &*inner_entry {
+                let body_start = r.position();
+                let elem_ctx = ctx.with_owner(inner_ref.clone());
+                if let Ok((struct_ref, _)) = resolve_struct_obj(&elem_ctx, *struct_obj) {
+                    let mut bin_elems = Vec::with_capacity(count as usize);
+                    let mut bin_ok = true;
+                    for _ in 0..count {
+                        match read_struct_binary(r, &elem_ctx, &struct_ref) {
+                            Ok(v) => bin_elems.push(v),
+                            Err(_) => {
+                                bin_ok = false;
+                                break;
+                            }
+                        }
+                        if r.position() > end {
+                            bin_ok = false;
+                            break;
+                        }
+                    }
+                    if bin_ok && r.position() == end {
+                        return Ok(PropertyValue::Array(bin_elems));
+                    }
+                    r.seek(SeekFrom::Start(body_start))?;
+                }
             }
-            return Ok(PropertyValue::Array(elems));
+            let mut elems = Vec::with_capacity(count as usize);
+            let mut errored = false;
+            for _ in 0..count {
+                match read_one_by_inner(r, ctx, &inner_ref, &inner_entry) {
+                    Ok(v) => elems.push(v),
+                    Err(_) => {
+                        errored = true;
+                        break;
+                    }
+                }
+                if r.position() > end {
+                    errored = true;
+                    break;
+                }
+            }
+            let consumed_exactly = !errored && r.position() == end;
+            if r.position() != end {
+                r.seek(SeekFrom::Start(end))?;
+            }
+            if consumed_exactly {
+                return Ok(PropertyValue::Array(elems));
+            }
+            eprintln!(
+                "  \x1b[33marr\x1b[0m '{prop_name}': {count} elements did not match \
+                 tag size ({size} bytes); emitted as Raw"
+            );
+            let mut buf = vec![0u8; (end - value_start) as usize];
+            r.seek(SeekFrom::Start(value_start))?;
+            r.read_exact(&mut buf)?;
+            r.seek(SeekFrom::Start(end))?;
+            return Ok(PropertyValue::Raw(buf));
         }
     }
 
-    let body = (size as u64).saturating_sub(4);
-    let mut buf = vec![0u8; body as usize];
+    let mut buf = vec![0u8; (end - value_start) as usize];
+    r.seek(SeekFrom::Start(value_start))?;
     r.read_exact(&mut buf)?;
     if ctx.db.is_none() {
         eprintln!(
@@ -477,7 +546,7 @@ fn parse_array_ctx(
 fn read_one_by_inner(
     r: &mut Cursor<&Vec<u8>>,
     ctx: &PropertyCtx,
-    _inner_ref: &ResolvedRef,
+    inner_ref: &ResolvedRef,
     inner: &SchemaEntry,
 ) -> Result<PropertyValue> {
     let kind = match inner {
@@ -509,10 +578,10 @@ fn read_one_by_inner(
             ])
         }
         PropertyKind::Array { .. } => {
-            let cnt = r.read_i32::<LittleEndian>()?;
+            let cnt = read_count(r)?;
             let mut v = Vec::with_capacity(cnt.max(0) as usize);
             for _ in 0..cnt.max(0) {
-                v.push(read_one_by_inner(r, ctx, _inner_ref, inner)?);
+                v.push(read_one_by_inner(r, ctx, inner_ref, inner)?);
             }
             PropertyValue::Array(v)
         }
@@ -523,10 +592,9 @@ fn read_one_by_inner(
             ));
         }
         PropertyKind::Struct { struct_obj, .. } => {
-            let owner_pkg = ctx.pak;
-
-            let (struct_ref, sentry) = resolve_struct_obj(ctx, *struct_obj)?;
-            read_struct_value(r, ctx, &struct_ref, &sentry, owner_pkg)?
+            let elem_ctx = ctx.with_owner(inner_ref.clone());
+            let (struct_ref, sentry) = resolve_struct_obj(&elem_ctx, *struct_obj)?;
+            read_struct_value(r, &elem_ctx, &struct_ref, &sentry, ctx.pak)?
         }
     })
 }
@@ -545,31 +613,40 @@ fn parse_struct_ctx(
     if let (Some(db), Some(owner)) = (ctx.db, &ctx.owner) {
         if let Ok(Some((sref, sentry))) = db.struct_for(owner, prop_name) {
             let start = r.position();
-            let end = start + size as u64;
+            let end = start + size.max(0) as u64;
+            {
+                let bin_ctx = ctx.with_owner(sref.clone());
+                if let Ok(v) = read_struct_binary(r, &bin_ctx, &sref) {
+                    if r.position() == end {
+                        return Ok(v);
+                    }
+                }
+                r.seek(SeekFrom::Start(start))?;
+            }
             let v = read_struct_value(r, ctx, &sref, &sentry, ctx.pak)?;
-            if r.position() < end {
-                r.seek(SeekFrom::Start(end))?;
-            } else if r.position() > end {
+            if r.position() > end {
                 eprintln!(
                     "  \x1b[33mstruct\x1b[0m '{prop_name}' ({struct_name}): \
-                     overran by {} bytes",
+                     overran by {} bytes; realigning to tag size",
                     r.position() - end
                 );
+            }
+            if r.position() != end {
+                r.seek(SeekFrom::Start(end))?;
             }
             return Ok(v);
         }
 
         if let Ok(Some((sref, sentry))) = db.lookup_struct_by_name(&owner.stem_lc, struct_name) {
             let start = r.position();
-            let end = start + size as u64;
+            let end = start + size.max(0) as u64;
             let v = read_struct_value(r, ctx, &sref, &sentry, ctx.pak)?;
-            if r.position() < end {
+            if r.position() != end {
                 r.seek(SeekFrom::Start(end))?;
             }
             return Ok(v);
         }
     }
-
     let start = r.position();
     let end = start + size as u64;
     let mut fields: Vec<Property> = Vec::new();
@@ -626,28 +703,239 @@ fn read_struct_value(
     sentry: &SchemaEntry,
     _owner_pak: &UPKPak,
 ) -> Result<PropertyValue> {
-    let immutable = false;
-    let child_ctx = ctx.with_owner(sref.clone());
+    if ctx.db.is_some() && struct_is_binary(sentry) {
+        return read_struct_binary(r, ctx, sref);
+    }
 
-    if immutable {
-        let db = ctx.db.unwrap();
-        let kids = db.list_children(sref).unwrap_or_default();
-        let mut fields = Vec::with_capacity(kids.len());
-        for (name, _cref, centry) in &kids {
-            let v = read_one_by_inner(r, &child_ctx, _cref, centry)?;
-            fields.push((name.clone(), v));
+    let child_ctx = ctx.with_owner(sref.clone());
+    let mut fields = Vec::new();
+    loop {
+        match parse_property_ctx(r, &child_ctx)? {
+            Some(p) if p.name == "None" => break,
+            Some(p) => fields.push(p),
+            None => break,
         }
-        Ok(PropertyValue::AtomicStruct(fields))
+    }
+    Ok(PropertyValue::Struct(fields))
+}
+
+fn struct_is_binary(sentry: &SchemaEntry) -> bool {
+    if let SchemaEntry::ScriptStruct { extra, .. } = sentry {
+        let f = extra.struct_flags;
+        (f & STRUCT_IMMUTABLE) != 0 || (f & STRUCT_IMMUTABLE_WHEN_COOKED) != 0
     } else {
-        let mut fields = Vec::new();
-        loop {
-            match parse_property_ctx(r, &child_ctx)? {
-                Some(p) if p.name == "None" => break,
-                Some(p) => fields.push(p),
-                None => break,
+        false
+    }
+}
+
+fn read_struct_binary(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    sref: &ResolvedRef,
+) -> Result<PropertyValue> {
+    let db = match ctx.db {
+        Some(d) => d,
+        None => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "no SchemaDb for binary struct read",
+            ));
+        }
+    };
+    let chain = db.class_chain(sref).unwrap_or_else(|_| vec![sref.clone()]);
+    let mut fields: Vec<(String, PropertyValue)> = Vec::new();
+    for klass in &chain {
+        let field_ctx = ctx.with_owner(klass.clone());
+        for (name, cref, centry) in db.list_children(klass).unwrap_or_default() {
+            let dim = match &*centry {
+                SchemaEntry::Property(k) => k.common().array_dim.max(1),
+                _ => continue,
+            };
+            if dim == 1 {
+                fields.push((name, read_one_by_inner(r, &field_ctx, &cref, &centry)?));
+            } else {
+                let mut arr = Vec::with_capacity(dim as usize);
+                for _ in 0..dim {
+                    arr.push(read_one_by_inner(r, &field_ctx, &cref, &centry)?);
+                }
+                fields.push((name, PropertyValue::Array(arr)));
             }
         }
-        Ok(PropertyValue::Struct(fields))
+    }
+    Ok(PropertyValue::AtomicStruct(fields))
+}
+
+pub const CPF_NATIVE: u64 = 0x0000_0000_0000_1000;
+
+type NativeField = (ResolvedRef, String, ResolvedRef, std::rc::Rc<SchemaEntry>);
+
+pub fn read_native_props(
+    tail: &[u8],
+    ctx_pak: &UPKPak,
+    ver: i16,
+    db: &SchemaDb,
+    class_ref: &ResolvedRef,
+) -> Option<Vec<Property>> {
+    if tail.is_empty() {
+        return None;
+    }
+    let chain = db.class_chain(class_ref).ok()?; // [self, super, ..., root]
+    let collect = |classes: &[ResolvedRef]| -> Vec<NativeField> {
+        let mut v = Vec::new();
+        for k in classes {
+            for (name, pref, pentry) in db.list_children(k).unwrap_or_default() {
+                let native = matches!(&*pentry, SchemaEntry::Property(pk)
+                    if pk.common().property_flags & CPF_NATIVE != 0);
+                if native {
+                    v.push((k.clone(), name, pref, pentry));
+                }
+            }
+        }
+        v
+    };
+
+    let mut base_first: Vec<ResolvedRef> = chain.clone();
+    base_first.reverse();
+
+    let candidates = [collect(&chain), collect(&base_first), collect(&chain[..1])];
+
+    let mut best: (usize, u64) = (0, 0);
+    for list in &candidates {
+        if list.is_empty() {
+            continue;
+        }
+        match try_read_native_list(tail, ctx_pak, ver, db, list) {
+            Ok(fields) => return Some(fields),
+            Err(miss) => {
+                if miss.1 > best.1 {
+                    best = miss;
+                }
+            }
+        }
+    }
+
+    if best.0 > 0 {
+        eprintln!(
+            "  \x1b[33mnative\x1b[0m '{}': no CPF_Native ordering consumed the tail \
+             exactly (best {} field(s), {} of {} bytes); emitting Raw",
+            db.export_object_name(class_ref).unwrap_or_default(),
+            best.0,
+            best.1,
+            tail.len()
+        );
+    }
+    None
+}
+
+fn try_read_native_list(
+    tail: &[u8],
+    ctx_pak: &UPKPak,
+    ver: i16,
+    db: &SchemaDb,
+    list: &[NativeField],
+) -> std::result::Result<Vec<Property>, (usize, u64)> {
+    let blob = tail.to_vec();
+    let mut r = Cursor::new(&blob);
+    let mut out: Vec<Property> = Vec::new();
+
+    for (kref, name, pref, pentry) in list {
+        let kctx = PropertyCtx {
+            pak: ctx_pak,
+            ver,
+            db: Some(db),
+            owner: Some(kref.clone()),
+        };
+        let dim = match &**pentry {
+            SchemaEntry::Property(k) => k.common().array_dim.max(1),
+            _ => 1,
+        };
+        let value = if dim > 1 {
+            let mut arr = Vec::with_capacity(dim as usize);
+            for _ in 0..dim {
+                match read_value_positional(&mut r, &kctx, pref, pentry) {
+                    Ok(v) => arr.push(v),
+                    Err(_) => return Err((out.len(), r.position())),
+                }
+            }
+            PropertyValue::Array(arr)
+        } else {
+            match read_value_positional(&mut r, &kctx, pref, pentry) {
+                Ok(v) => v,
+                Err(_) => return Err((out.len(), r.position())),
+            }
+        };
+        out.push(Property {
+            name: name.clone(),
+            prop_type: String::new(),
+            size: 0,
+            array_index: 0,
+            value,
+            enum_name: None,
+            struct_name: None,
+        });
+        if r.position() as usize > blob.len() {
+            return Err((out.len(), r.position()));
+        }
+    }
+
+    if r.position() as usize == blob.len() {
+        Ok(out)
+    } else {
+        Err((out.len(), r.position()))
+    }
+}
+
+fn native_tail_miss(out: &[Property], consumed: u64, total: usize) -> Option<Vec<Property>> {
+    if !out.is_empty() {
+        eprintln!(
+            "  \x1b[33mnative\x1b[0m schema parse read {} CPF_Native field(s) but \
+             consumed {} of {} tail bytes; emitting Raw",
+            out.len(),
+            consumed,
+            total
+        );
+    }
+    None
+}
+
+fn read_value_positional(
+    r: &mut Cursor<&Vec<u8>>,
+    ctx: &PropertyCtx,
+    prop_ref: &ResolvedRef,
+    entry: &SchemaEntry,
+) -> Result<PropertyValue> {
+    let kind = match entry {
+        SchemaEntry::Property(k) => k,
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "native field is not a UProperty",
+            ));
+        }
+    };
+    match kind {
+        PropertyKind::Struct { struct_obj, .. } => {
+            let sctx = ctx.with_owner(prop_ref.clone());
+            let (sref, _) = resolve_struct_obj(&sctx, *struct_obj)?;
+            read_struct_binary(r, &sctx, &sref)
+        }
+        PropertyKind::Array { inner, .. } => {
+            let count = read_count(r)?;
+            let db = ctx
+                .db
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no SchemaDb"))?;
+            let pkg = db.open_package(&prop_ref.stem_lc)?;
+            let inner_ref = db
+                .resolve_index(&pkg, *inner)?
+                .ok_or_else(|| Error::new(ErrorKind::NotFound, "array inner unresolved"))?;
+            let inner_entry = db.entry(&inner_ref)?;
+            let mut v = Vec::with_capacity(count.max(0) as usize);
+            for _ in 0..count.max(0) {
+                v.push(read_value_positional(r, ctx, &inner_ref, &inner_entry)?);
+            }
+            Ok(PropertyValue::Array(v))
+        }
+        _ => read_one_by_inner(r, ctx, prop_ref, entry),
     }
 }
 

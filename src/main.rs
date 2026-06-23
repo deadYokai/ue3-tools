@@ -244,6 +244,10 @@ enum Commands {
         path: String,
     },
 
+    Decompress {
+        path: String,
+    },
+
     #[command(about = "Print elements in object")]
     Elements {
         ron_path: String,
@@ -371,6 +375,18 @@ fn schema_resolve(starting: &str, full_path: &str, game_root: &str, verbose: boo
     Ok(())
 }
 
+fn upk_decompress_to_file(path: &str) -> Result<()> {
+    let (cur, _head) = upk_header_cursor(path)?;
+    let path = Path::new(path);
+    let fp = format!(
+        "{}.decompressed.upk",
+        path.file_stem().and_then(|s| s.to_str()).unwrap()
+    );
+    let mut file = File::create(path.with_file_name(fp))?;
+    file.write_all(cur.get_ref())?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -378,6 +394,10 @@ fn main() -> Result<()> {
         Commands::UpkHeader { path } => {
             upk_header_cursor(&path)?;
         }
+        Commands::Decompress { path } => {
+            upk_decompress_to_file(&path)?;
+        }
+
         Commands::Elements { ron_path, path } => {
             print_obj_elements(&ron_path, &path)?;
         }

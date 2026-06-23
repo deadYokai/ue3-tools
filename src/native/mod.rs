@@ -69,6 +69,7 @@ pub enum NativePayload {
 
     Raw { bytes: Vec<u8> },
 
+    NativeProps { fields: Vec<Property> },
     Texture2D(Texture2DPayload),
     SwfMovie(SwfMoviePayload),
     SoundNodeWave(SoundNodeWavePayload),
@@ -82,6 +83,7 @@ impl NativePayload {
             NativePayload::Texture2D(_) => "Texture2D",
             NativePayload::SwfMovie(_) => "SwfMovie",
             NativePayload::SoundNodeWave(_) => "SoundNodeWave",
+            NativePayload::NativeProps { .. } => "NativeProps",
         }
     }
 }
