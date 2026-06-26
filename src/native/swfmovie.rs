@@ -9,6 +9,8 @@ use crate::{
     upkprops::PropertyValue,
 };
 
+use super::NativeInjectCtx;
+
 #[derive(Debug, Clone)]
 pub struct SwfMoviePayload {
     pub raw_data: Vec<u8>,
@@ -99,5 +101,63 @@ impl NativeSerializer for SwfMovieSer {
             p.raw_data.len()
         );
         Ok(vec![gfx_path])
+    }
+
+    fn inject_external(&self, ctx: &mut NativeInjectCtx) -> Result<bool> {
+        let sidecar = ctx.sidecars.iter().find(|f| {
+            let l = f.to_ascii_lowercase();
+            l.ends_with(".gfx") || l.ends_with(".swf")
+        });
+        let fname = match sidecar {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+
+        let path = ctx.sidecar_dir.join(fname);
+        if !path.exists() {
+            eprintln!(
+                "  \x1b[33mgfx\x1b[0m: sidecar '{fname}' not found next to the .uo; \
+                 keeping original RawData"
+            );
+            return Ok(false);
+        }
+        let bytes = std::fs::read(&path)?;
+
+        let target = ctx.externalized_prop.as_deref().unwrap_or("RawData");
+        let prop = match ctx.props.iter_mut().find(|p| p.name == target) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "  \x1b[33mgfx\x1b[0m: property '{target}' is not in the original \
+                     export; cannot inject '{fname}'"
+                );
+                return Ok(false);
+            }
+        };
+
+        match &mut prop.value {
+            PropertyValue::Array(items) => {
+                *items = bytes.iter().map(|b| PropertyValue::Byte(*b)).collect();
+            }
+            PropertyValue::Raw(buf) => {
+                let mut nb = Vec::with_capacity(4 + bytes.len());
+                nb.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
+                nb.extend_from_slice(&bytes);
+                *buf = nb;
+            }
+            _ => {
+                eprintln!(
+                    "  \x1b[33mgfx\x1b[0m: property '{target}' is not a byte array; \
+                     cannot inject '{fname}'"
+                );
+                return Ok(false);
+            }
+        }
+
+        println!(
+            "  \x1b[36mgfx\x1b[0m ← \x1b[32m{fname}\x1b[0m  ({} bytes) → {target}",
+            bytes.len()
+        );
+        Ok(true)
     }
 }

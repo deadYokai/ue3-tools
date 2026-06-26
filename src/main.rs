@@ -13,6 +13,7 @@ use self::{
 
 mod native;
 mod pseudo;
+mod pseudo_parse;
 mod schema;
 mod schemadb;
 mod types;
@@ -276,6 +277,13 @@ enum Commands {
         ron_path: String,
     },
 
+    #[command(about = "Compile edited .uo files into loader-ready .bin + .namemap overrides")]
+    PackMod {
+        extracted_dir: String,
+        #[arg(long = "out", short = 'o', value_name = "DIR")]
+        out_dir: Option<String>,
+    },
+
     #[command(about = "Create a UE3 Font UPK from a TrueType / OpenType font file")]
     CreateFont {
         font_file: String,
@@ -426,6 +434,17 @@ fn main() -> Result<()> {
             )?
         }
         Commands::Pack { .. } => unimplemented!(),
+        Commands::PackMod {
+            extracted_dir,
+            out_dir,
+        } => {
+            pack_mod_cmd(
+                &extracted_dir,
+                cli.game_root.as_deref(),
+                out_dir.as_deref(),
+                cli.verbose,
+            )?;
+        }
         Commands::CreateFont {
             font_file,
             font_name,
@@ -478,6 +497,23 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn pack_mod_cmd(
+    extracted_dir: &str,
+    game_root: Option<&str>,
+    out_dir: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    use std::path::Path;
+
+    let opts = upkpacker::PackOptions {
+        extracted_dir: Path::new(extracted_dir),
+        game_root: game_root.filter(|s| !s.is_empty()).map(Path::new),
+        out_dir: out_dir.filter(|s| !s.is_empty()).map(Path::new),
+        verbose,
+    };
+    upkpacker::pack_mod(&opts)
 }
 
 fn open_ui(game_root: Option<&str>, verbose: bool) -> Result<()> {

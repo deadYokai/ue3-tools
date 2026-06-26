@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -19,7 +20,7 @@ use crate::{
     },
 };
 
-use super::BulkBlock;
+use super::{BulkBlock, NativeInjectCtx};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mip {
@@ -316,9 +317,114 @@ impl NativeSerializer for Texture2DSer {
         );
         Ok(vec![dds_path])
     }
+
+    fn inject_external(&self, ctx: &mut NativeInjectCtx) -> Result<bool> {
+        let sidecar = ctx
+            .sidecars
+            .iter()
+            .find(|f| f.to_ascii_lowercase().ends_with(".dds"));
+        let fname = match sidecar {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+
+        let path = ctx.sidecar_dir.join(fname);
+        if !path.exists() {
+            eprintln!(
+                "  \x1b[33mtex\x1b[0m: sidecar '{fname}' not found next to the .uo; \
+                 keeping original mips"
+            );
+            return Ok(false);
+        }
+        let bytes = std::fs::read(&path)?;
+        let dds = Dds::decode(&bytes)?;
+
+        let expected = prop_enum_label(ctx.props, "Format").and_then(PixelFormat::from_pf_label);
+        let new_tail = reinject_mips_from_dds(ctx.native_tail, &dds, expected, ctx.ver)?;
+        *ctx.native_tail = new_tail;
+
+        println!(
+            "  \x1b[36mtexture\x1b[0m ← \x1b[32m{fname}\x1b[0m  ({} mip(s), {})",
+            dds.mips.len(),
+            dds.format.as_pf_label(),
+        );
+        Ok(true)
+    }
 }
 
-#[allow(dead_code)]
+pub fn reinject_mips_from_dds(
+    tail: &[u8],
+    dds: &Dds,
+    expected_format: Option<PixelFormat>,
+    _ver: i16,
+) -> Result<Vec<u8>> {
+    if let Some(exp) = expected_format {
+        if exp != dds.format {
+            eprintln!(
+                "  \x1b[33mtex\x1b[0m: DDS is {} but the texture's Format is {}; \
+                 injecting anyway — make sure that's intended",
+                dds.format.as_pf_label(),
+                exp.as_pf_label(),
+            );
+        }
+    }
+
+    let mut c = Cursor::new(tail);
+    let _source_art = BulkBlock::read(&mut c)?;
+    let mips_start = c.position() as usize;
+    let mut mips = read_indirect_mips(&mut c)?;
+    let mips_end = c.position() as usize;
+
+    let mut by_dim: HashMap<(i32, i32), &Vec<u8>> = HashMap::new();
+    for m in &dds.mips {
+        by_dim.insert((m.width as i32, m.height as i32), &m.data);
+    }
+
+    let mut matched = 0usize;
+    for mip in mips.iter_mut() {
+        if let Some(data) = by_dim.get(&(mip.size_x, mip.size_y)) {
+            mip.data = (*data).clone();
+            mip.flags &= !(BULKDATA_STORE_IN_SEPARATE_FILE | BULKDATA_SERIALIZE_COMPRESSED);
+            mip.size_on_disk = mip.data.len() as i32;
+            mip.element_count = mip.data.len() as i32;
+            mip.offset_in_file = 0;
+            mip.source = MipSource::Inline;
+            matched += 1;
+        }
+    }
+
+    if matched == 0 {
+        let (w, h) = dds
+            .mips
+            .first()
+            .map(|m| (m.width, m.height))
+            .unwrap_or((0, 0));
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "DDS top mip {w}x{h} matches no mip in the original texture; \
+                 refusing to inject (resizing needs SizeX/SizeY edits in the .uo)"
+            ),
+        ));
+    }
+    if matched < dds.mips.len() {
+        eprintln!(
+            "  \x1b[33mtex\x1b[0m: {} of {} DDS mip(s) had no matching slot and were ignored",
+            dds.mips.len() - matched,
+            dds.mips.len()
+        );
+    }
+
+    let mut new_mips = Vec::new();
+    write_indirect_mips(&mut Cursor::new(&mut new_mips), &mips)?;
+
+    let mut out = Vec::with_capacity(mips_start + new_mips.len() + tail.len() - mips_end);
+    out.extend_from_slice(&tail[..mips_start]);
+    out.extend_from_slice(&new_mips);
+    out.extend_from_slice(&tail[mips_end..]);
+    Ok(out)
+}
+
 fn write_indirect_mips<W: Write + Seek>(w: &mut W, mips: &[Mip]) -> Result<()> {
     w.write_i32::<LittleEndian>(mips.len() as i32)?;
     for m in mips {

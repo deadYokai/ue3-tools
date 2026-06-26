@@ -357,10 +357,11 @@ pub fn write_fstring<W: Write>(w: &mut W, s: &str) -> Result<()> {
         w.write_i32::<LittleEndian>(0)?;
         return Ok(());
     }
-    if s.is_ascii() {
-        let len = s.len() as i32 + 1;
+    if s.chars().all(|c| (c as u32) <= 0xFF) {
+        let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+        let len = bytes.len() as i32 + 1;
         w.write_i32::<LittleEndian>(len)?;
-        w.write_all(s.as_bytes())?;
+        w.write_all(&bytes)?;
         w.write_u8(0)?;
     } else {
         let utf16: Vec<u16> = s.encode_utf16().collect();

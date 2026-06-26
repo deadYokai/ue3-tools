@@ -162,6 +162,7 @@ pub fn render(input: &EmitInput) -> String {
         let mut line = String::new();
         let _ = write!(line, "{INDENT}{} = ", p.name);
         render_value(&mut line, &p.value, &resolver, input.pak, 1);
+        line.push_str(&type_suffix(p));
         line.push('\n');
         out.push_str(&line);
     }
@@ -176,6 +177,7 @@ pub fn render(input: &EmitInput) -> String {
                     let mut line = String::new();
                     let _ = write!(line, "{INDENT}{} = ", p.name);
                     render_value(&mut line, &p.value, &resolver, input.pak, 1);
+                    line.push_str(&type_suffix(p));
                     line.push('\n');
                     out.push_str(&line);
                 }
@@ -351,6 +353,7 @@ pub fn render_class_def(
             let mut line = String::new();
             let _ = write!(line, "{INDENT}{INDENT}{} = ", p.name);
             render_value(&mut line, &p.value, &resolver, pak, 2);
+            line.push_str(&type_suffix(p));
             line.push('\n');
             out.push_str(&line);
         }
@@ -413,6 +416,7 @@ pub fn render_struct_def(
             let mut line = String::new();
             let _ = write!(line, "{INDENT}{INDENT}{} = ", p.name);
             render_value(&mut line, &p.value, &resolver, pak, 2);
+            line.push_str(&type_suffix(p));
             line.push('\n');
             out.push_str(&line);
         }
@@ -692,6 +696,72 @@ fn render_struct_decl(
     let _ = writeln!(out, "{pad}}};");
 }
 
+fn prop_type_label(p: &Property) -> Option<String> {
+    let label = match p.prop_type.as_str() {
+        "IntProperty" => "int".to_string(),
+        "FloatProperty" => "float".to_string(),
+        "BoolProperty" => "bool".to_string(),
+        "NameProperty" => "name".to_string(),
+        "StrProperty" => "string".to_string(),
+        "ObjectProperty" => "object".to_string(),
+        "ComponentProperty" => "component".to_string(),
+        "InterfaceProperty" => "interface".to_string(),
+        "ClassProperty" => "class".to_string(),
+        "DelegateProperty" => "delegate".to_string(),
+        "MapProperty" => "map".to_string(),
+        "ByteProperty" => match p.enum_name.as_deref() {
+            Some(e) if e != "None" => e.to_string(),
+            _ => "byte".to_string(),
+        },
+        "StructProperty" => match p.struct_name.as_deref() {
+            Some(s) if s != "None" => s.to_string(),
+            _ => "struct".to_string(),
+        },
+        "ArrayProperty" => match &p.value {
+            PropertyValue::Array(items) => array_label(items),
+            _ => "array".to_string(),
+        },
+        "" => return value_type_label(&p.value),
+        other => other.to_string(),
+    };
+    Some(label)
+}
+
+fn value_type_label(v: &PropertyValue) -> Option<String> {
+    let label = match v {
+        PropertyValue::None | PropertyValue::Raw(_) => return None,
+        PropertyValue::Byte(_) => "byte".to_string(),
+        PropertyValue::Int(_) => "int".to_string(),
+        PropertyValue::Bool(_) => "bool".to_string(),
+        PropertyValue::Float(_) => "float".to_string(),
+        PropertyValue::Object(_) | PropertyValue::ObjectRef(_) => "object".to_string(),
+        PropertyValue::Name(_) => "name".to_string(),
+        PropertyValue::String(_) => "string".to_string(),
+        PropertyValue::EnumLabel(s) => s.split("::").next().unwrap_or("byte").to_string(),
+        PropertyValue::Array(items) => array_label(items),
+        PropertyValue::Struct(_) | PropertyValue::AtomicStruct(_) => "struct".to_string(),
+    };
+    Some(label)
+}
+
+fn array_label(items: &[PropertyValue]) -> String {
+    let inner = items
+        .iter()
+        .find(|e| !matches!(e, PropertyValue::None))
+        .and_then(value_type_label);
+    match inner {
+        Some(t) => format!("array<{t}>"),
+        None => "array".to_string(),
+    }
+}
+
+fn type_suffix(p: &Property) -> String {
+    match prop_type_label(p) {
+        Some(t) => format!("   // {t}"),
+        None => String::new(),
+    }
+}
+
 fn render_value(out: &mut String, v: &PropertyValue, r: &RefResolver, pak: &UPKPak, depth: usize) {
     use PropertyValue::*;
     match v {
@@ -818,6 +888,7 @@ fn render_struct(
         out.push_str(&pad_in);
         let _ = write!(out, "{} = ", p.name);
         render_value(out, &p.value, r, pak, depth + 1);
+        out.push_str(&type_suffix(p));
         out.push('\n');
     }
     out.push_str(&pad);

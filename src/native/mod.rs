@@ -113,6 +113,16 @@ pub struct NativeReadCtx<'a> {
     pub class_ref: Option<ResolvedRef>,
 }
 
+pub struct NativeInjectCtx<'a> {
+    pub props: &'a mut Vec<Property>,
+    pub native_tail: &'a mut Vec<u8>,
+    pub sidecar_dir: &'a Path,
+    pub sidecars: &'a [String],
+    pub externalized_prop: Option<String>,
+    pub ver: i16,
+    pub pak: &'a UPKPak,
+}
+
 pub trait NativeSerializer {
     fn class_name(&self) -> &'static str;
 
@@ -125,6 +135,10 @@ pub trait NativeSerializer {
         _stem: &str,
     ) -> Result<Vec<PathBuf>> {
         Ok(Vec::new())
+    }
+
+    fn inject_external(&self, _ctx: &mut NativeInjectCtx) -> Result<bool> {
+        Ok(false)
     }
 }
 
